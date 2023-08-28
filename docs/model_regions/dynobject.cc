@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 
 class UnionFind
 {
@@ -50,7 +51,6 @@ protected:
     parent |= 0x3;
   }
 
-public:
   // Default to an implicit region root.
   UnionFind() : parent(2) {}
 
@@ -110,16 +110,57 @@ public:
 
 class Reference;
 
-class DynObject : UnionFind
+class DynObject;
+
+class ObjectReference
 {
   friend class Reference;
 
-  bool is_region;
+  std::shared_ptr<DynObject> object;
 
-  std::map<std::string, DynObject*> fields;
 public:
+  ObjectReference() : object(nullptr) {}
+
+  ObjectReference(std::shared_ptr<DynObject> object) : object(object) {}
+
+  ObjectReference(const ObjectReference& objref) : object(objref.object) {}
+
+  ObjectReference(ObjectReference&& objref) : object(objref.object) {}
+
+  ObjectReference& operator=(const ObjectReference& other)
+  {
+    object = other.object;
+    return *this;
+  }
+
+  ObjectReference& operator=(ObjectReference&& other)
+  {
+    object = other.object;
+    return *this;
+  }
+
   Reference operator[](std::string name);
 
+  static ObjectReference create()
+  {
+    return {std::make_shared<DynObject>()};
+  }
+
+  static ObjectReference create_region()
+  {
+    return {std::make_shared<DynObject>(true)};
+  }
+};
+
+class DynObject : UnionFind
+{
+  friend class Reference;
+  friend class ObjectReference;
+
+  bool is_region;
+
+  std::map<std::string, ObjectReference> fields;
+public:
   DynObject(bool is_region = false) : is_region(is_region)
   {
     if (is_region)
@@ -135,64 +176,66 @@ class Reference
 public:
   Reference(std::string name, DynObject* object) : key(name), object(object) {}
 
-  operator DynObject*() const { return object->fields[key]; }
+  operator ObjectReference() { return object->fields[key]; }
 
-  Reference& operator=(DynObject* other)
+  Reference& operator=(const ObjectReference& other)
   {
-    object->fields[key] = other;
-    if (!other->is_region)
-      object->merge(other);
+    ObjectReference& cell = object->fields[key];
+    cell = other;
+    if (!other.object->is_region)
+      object->merge(other.object.get());
     return *this;
   }
 };
 
-Reference DynObject::operator[](std::string name)
+Reference ObjectReference::operator[](std::string name)
 {
-  return Reference(name, this);
+  return Reference(name, this->object.get());
 };
 
 
 int main()
 {
   std::cout << "region a" << std::endl;
-  DynObject* a = new DynObject(true);
+  auto a = ObjectReference::create_region();
   std::cout << "region b" << std::endl;
-  DynObject* b = new DynObject(true);
+  auto b = ObjectReference::create_region();
   std::cout << "object c" << std::endl;
-  DynObject* c = new DynObject();
+  
+  auto c = ObjectReference::create();
   std::cout << "object d" << std::endl;
-  DynObject* d = new DynObject();
+  auto d = ObjectReference::create();
   std::cout << "object e" << std::endl;
-  DynObject* e = new DynObject();
+  auto e = ObjectReference::create();
   std::cout << "object f" << std::endl;
-  DynObject* f = new DynObject();
+  auto f = ObjectReference::create();
 
   // Merge implicit regions
   std::cout << "c.x = e" << std::endl;
-  (*c)["x"] = e;
+  c["x"] = e;
   // Merge explicit and implicit
   std::cout << "a.x = c" << std::endl;
-  (*a)["x"] = c;
+  a["x"] = c;
 
   // Merge implicit and explicit
   std::cout << "f.w = a" << std::endl;
-  (*f)["w"] = c;
+  f["w"] = c;
 
   // Merge explicit and implicit
   std::cout << "b.y = d" << std::endl;
-  (*b)["y"] = d;
+  b["y"] = d;
 
   // Should already be the same region
   std::cout << "a.y = e" << std::endl;
-  (*a)["y"] = e;
+  a["y"] = e;
 
   // Nest a region
   std::cout << "a.y = b" << std::endl;
-  (*a)["y"] = b;
+  a["y"] = b;
   
   // Should fail.
   std::cout << "a.z = d" << std::endl;
-  (*a)["z"] = d;
+  a["z"] = d;
 
   return 0;
 }
