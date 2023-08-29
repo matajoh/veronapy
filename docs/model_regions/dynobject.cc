@@ -254,7 +254,7 @@ public:
     return *this;
   }
 
-  // This should not be treated like a borrow for efficiency reasons.
+  // This should be treated as borrowed for efficiency reasons.
   Reference(const Reference& other) = delete;
   Reference& operator=(const Reference& other) = delete;
   Reference(Reference&& other) = delete;
