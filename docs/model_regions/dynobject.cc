@@ -3,9 +3,6 @@
  * 
  * It uses a union-find data structure to track the regions, and efficiently
  * merge them when necessary. 
- *
- * TODO track uniqueness of regions - currently this allows the same region
- * to be assigned to multiple objects, and hence breaks its uniqueness. 
  */
 
 
@@ -17,6 +14,14 @@
 #include <memory>
 
 class ObjectReference;
+
+class region_exception : public std::exception
+{
+  std::string msg;
+public:
+  region_exception(std::string msg) : msg(msg) {}
+  const char* what() const noexcept override { return msg.c_str(); }
+};
 
 class RegionObject
 {
@@ -157,8 +162,7 @@ protected:
     // Determine if the merge is valid.
     if (this_root->is_explicit() && other_root->is_explicit())
     {
-      std::cout << "Merging two explicit regions - abort" << std::endl;
-      abort();
+      throw region_exception("Merging two explicit regions!");
     }
 
     // Preserve explicit marker if on smaller side.
@@ -187,6 +191,10 @@ public:
 
   ObjectReference(const ObjectReference& objref) : object(objref.object)
   {
+    if (object->is_region)
+    {
+      throw region_exception("Copying region constructor - abort");
+    }
     if (object)
       object->inc_strong_ref();
   }
@@ -198,6 +206,10 @@ public:
 
   ObjectReference& operator=(const ObjectReference& other)
   {
+    if (other.object->is_region)
+    {
+      throw region_exception("Copying region assign - abort");
+    }
     if (object)
       object->dec_strong_ref();
     object = other.object;
@@ -254,6 +266,15 @@ public:
     return *this;
   }
 
+  Reference& operator=(ObjectReference&& other)
+  {
+    ObjectReference& cell = object.object->fields[key];
+    cell = std::move(other);
+    if (!cell.object->is_region)
+      object.object->merge(cell.object);
+    return *this;
+  }
+
   // This should be treated as borrowed for efficiency reasons.
   Reference(const Reference& other) = delete;
   Reference& operator=(const Reference& other) = delete;
@@ -303,12 +324,19 @@ int main()
   a["y"] = e;
 
   // Nest a region
-  std::cout << "a.y = b" << std::endl;
-  a["y"] = b;
+  std::cout << "a.y = std::move(b)" << std::endl;
+  a["y"] = std::move(b);
   
   // Should fail.
-  std::cout << "a.z = d" << std::endl;
-  a["z"] = d;
+  try 
+  {
+    std::cout << "a.z = d" << std::endl;
+    a["z"] = d;
+  }
+  catch (region_exception& e)
+  {
+    std::cout << "Expected - Caught exception: " << e.what() << std::endl;
+  }
 
   return 0;
 }
