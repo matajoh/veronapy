@@ -31,8 +31,11 @@ static PyObject *Region_new(PyTypeObject *type, PyObject *args,
   RegionObject *self;
   self = (RegionObject *)type->tp_alloc(type, 0);
   if (self != NULL) {
-    Py_INCREF(Py_None);
-    self->name = Py_None;
+    self->name = PyUnicode_FromString("");
+    if (self->name == NULL) {
+      Py_DECREF(self);
+      return NULL;
+    }
     Py_INCREF(Py_None);
     self->alias = Py_None;
     Py_INCREF(Py_None);
@@ -141,15 +144,25 @@ static int Region_setisshared(RegionObject *self, PyObject *value,
 }
 
 static PyGetSetDef Region_getsetters[] = {
-    {"name", (getter)Region_getname, (setter)Region_setname, "name", NULL},
+    {"name", (getter)Region_getname, (setter)Region_setname,
+     "Human-readable name for the region", NULL},
     {"__identity__", (getter)Region_getidentity, (setter)Region_setidentity,
-     "__identity__", NULL},
+     "The immutable, unique identity for the region", NULL},
     {"__region__", (getter)Region_getregion, (setter)Region_setregion,
-     "__region__", NULL},
-    {"is_open", (getter)Region_getisopen, (setter)Rego_setisopen, "is_open",
-     NULL},
+     "The parent region", NULL},
+    {"is_open", (getter)Region_getisopen, (setter)Rego_setisopen,
+     "Whether the region is currently open", NULL},
     {"is_shared", (getter)Region_getisshared, (setter)Region_setisshared,
-     "is_shared", NULL},
+     "Whether the region is shared", NULL},
+    {NULL} /* Sentinel */
+};
+
+static PyObject *Region_str(RegionObject *self, PyObject *Py_UNUSED(ignored)) {
+  return PyUnicode_FromFormat("Region(%S<%d>)", self->name, self->__identity__);
+}
+
+static PyMethodDef Region_methods[] = {
+    {NULL} /* Sentinel */
 };
 
 static PyTypeObject RegionType = {
@@ -161,7 +174,9 @@ static PyTypeObject RegionType = {
     .tp_new = Region_new,
     .tp_init = (initproc)Region_init,
     .tp_dealloc = (destructor)Region_dealloc,
+    .tp_methods = Region_methods,
     .tp_getset = Region_getsetters,
+    .tp_str = (reprfunc)Region_str,
 };
 
 static PyModuleDef veronapymodule = {
