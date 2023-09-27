@@ -17,7 +17,6 @@ typedef struct {
   bool is_open;
   bool is_shared;
   PyObject *__region__;
-  PyObject *children;
 } RegionObject;
 
 static void Region_dealloc(RegionObject *self) {
@@ -43,11 +42,6 @@ static PyObject *Region_new(PyTypeObject *type, PyObject *args,
     self->is_open = false;
     self->is_shared = false;
     self->__identity__ = 0;
-    self->children = PyList_New(0);
-    if (self->children == NULL) {
-      Py_DECREF(self);
-      return NULL;
-    }
   }
 
   return (PyObject *)self;
