@@ -411,6 +411,61 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
   return -1;
 }
 
+static Py_ssize_t Isolated_mp_length(PyObject *self)
+{
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(0);
+  VPY_GETREGION(0);
+
+  if (region->is_open)
+  {
+    self->ob_type = type;
+    Py_ssize_t size = PyObject_Length(self);
+    self->ob_type = isolated_type;
+    return size;
+  }
+
+  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+  return 0;
+}
+
+static PyObject *Isolated_mp_subscript(PyObject *self, PyObject *key)
+{
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
+
+  if (region->is_open)
+  {
+    self->ob_type = type;
+    PyObject *obj = PyObject_GetItem(self, key);
+    self->ob_type = isolated_type;
+    return obj;
+  }
+
+  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+  return NULL;
+}
+
+static int Isolated_mp_ass_subscript(PyObject *self, PyObject *key, PyObject *value)
+{
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(-1);
+  VPY_GETREGION(-1);
+
+  if (region->is_open)
+  {
+    int rc;
+    self->ob_type = type;
+    rc = PyObject_SetItem(self, key, value);
+    self->ob_type = isolated_type;
+    return rc;
+  }
+
+  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+  return -1;
+}
+
 static bool is_imm(PyObject *value)
 {
   if (Py_IsNone(value) || PyBool_Check(value) || PyLong_Check(value) || PyFloat_Check(value) || PyComplex_Check(value) || PyUnicode_Check(value) || PyBytes_Check(value) || PyRange_Check(value))
@@ -462,6 +517,9 @@ static int capture_object(RegionObject *region, PyObject *value)
   if (!is_imm(value))
   {
     PyType_Slot slots[] = {
+        {Py_mp_length, NULL},
+        {Py_mp_subscript, NULL},
+        {Py_mp_ass_subscript, NULL},
         {Py_tp_finalize, Isolated_finalize},
         {Py_tp_repr, Isolated_repr},
         {Py_tp_traverse, Isolated_traverse},
@@ -470,6 +528,23 @@ static int capture_object(RegionObject *region, PyObject *value)
         {Py_tp_setattro, Isolated_setattro},
         {0, NULL} /* Sentinel */
     };
+
+    if (type->tp_as_mapping != NULL)
+    {
+      PyMappingMethods *map_methods = type->tp_as_mapping;
+      if (map_methods->mp_length != NULL)
+      {
+        slots[0].pfunc = Isolated_mp_length;
+      }
+      if (map_methods->mp_subscript != NULL)
+      {
+        slots[1].pfunc = Isolated_mp_subscript;
+      }
+      if (map_methods->mp_ass_subscript != NULL)
+      {
+        slots[2].pfunc = Isolated_mp_ass_subscript;
+      }
+    }
 
     PyType_Spec spec = {
         .name = "region.isolated",
