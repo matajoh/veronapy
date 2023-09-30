@@ -436,184 +436,118 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
   return rc;
 }
 
-static Py_ssize_t Isolated_mp_length(PyObject *self)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(0);
-  VPY_GETREGION(0);
-  VPY_CHECKREGIONOPEN(0);
-
-  self->ob_type = type;
-  Py_ssize_t size = PyMapping_Length(self);
-  self->ob_type = isolated_type;
-  return size;
-}
-
-static PyObject *Isolated_mp_subscript(PyObject *self, PyObject *key)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
-
-  self->ob_type = type;
-  PyObject *obj = PyObject_GetItem(self, key);
-  self->ob_type = isolated_type;
-  return obj;
-}
-
-static int Isolated_mp_ass_subscript(PyObject *self, PyObject *key, PyObject *value)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  int rc;
-  VPY_GETTYPE(-1);
-  VPY_GETREGION(-1);
-  VPY_CHECKREGIONOPEN(-1);
-
-  self->ob_type = type;
-  if (value == NULL)
-  {
-    rc = PyObject_DelItem(self, key);
+#define VPY_LENFUNC(interface, name)               \
+  Py_ssize_t Isolated_##name(PyObject *self)       \
+  {                                                \
+    PyTypeObject *isolated_type = Py_TYPE(self);   \
+    VPY_GETTYPE(0);                                \
+    VPY_GETREGION(0);                              \
+    VPY_CHECKREGIONOPEN(0);                        \
+    self->ob_type = type;                          \
+    Py_ssize_t size = type->interface->name(self); \
+    self->ob_type = isolated_type;                 \
+    return size;                                   \
   }
-  else
-  {
-    VPY_CHECKVALUEREGION(-1);
-    rc = rc = PyObject_SetItem(self, key, value);
+
+#define VPY_BINARYFUNC(interface, name)                      \
+  PyObject *Isolated_##name(PyObject *self, PyObject *value) \
+  {                                                          \
+    PyTypeObject *isolated_type = Py_TYPE(self);             \
+    VPY_GETTYPE(NULL);                                       \
+    VPY_GETREGION(NULL);                                     \
+    VPY_CHECKREGIONOPEN(NULL);                               \
+    if (value != NULL)                                       \
+    {                                                        \
+      VPY_CHECKVALUEREGION(NULL);                            \
+    }                                                        \
+    self->ob_type = type;                                    \
+    PyObject *result = type->interface->name(self, value);   \
+    self->ob_type = isolated_type;                           \
+    return result;                                           \
   }
-  self->ob_type = isolated_type;
 
-  return rc;
-}
-
-static Py_ssize_t Isolated_sq_length(PyObject *self)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(0);
-  VPY_GETREGION(0);
-  VPY_CHECKREGIONOPEN(0);
-
-  Py_ssize_t size;
-  self->ob_type = type;
-  size = PySequence_Length(self);
-  self->ob_type = isolated_type;
-  return size;
-}
-
-static PyObject *Isolated_sq_concat(PyObject *self, PyObject *value)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
-  VPY_CHECKVALUEREGION(NULL);
-
-  PyObject *result;
-  self->ob_type = type;
-  value->ob_type = value_type;
-  result = PySequence_Concat(self, value);
-  value->ob_type = value_isolated_type;
-  self->ob_type = isolated_type;
-  return result;
-}
-
-static PyObject *Isolated_sq_repeat(PyObject *self, Py_ssize_t num_times)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
-
-  PyObject *result;
-  self->ob_type = type;
-  result = PySequence_Repeat(self, num_times);
-  self->ob_type = isolated_type;
-  return result;
-}
-
-static PyObject *Isolated_sq_item(PyObject *self, Py_ssize_t index)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
-
-  PyObject *result;
-  self->ob_type = type;
-  result = PySequence_GetItem(self, index);
-  self->ob_type = isolated_type;
-  return result;
-}
-
-static int Isolated_sq_ass_item(PyObject *self, Py_ssize_t index, PyObject *value)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  int rc;
-  VPY_GETTYPE(-1);
-  VPY_GETREGION(-1);
-  VPY_CHECKREGIONOPEN(-1);
-
-  self->ob_type = type;
-  if (value == NULL)
-  {
-    rc = PySequence_DelItem(self, index);
+#define VPY_OBJOBJARGPROC(interface, name)           \
+  int Isolated_##name(PyObject *self, PyObject *key, \
+                      PyObject *value)               \
+  {                                                  \
+    PyTypeObject *isolated_type = Py_TYPE(self);     \
+    int rc;                                          \
+    VPY_GETTYPE(-1);                                 \
+    VPY_GETREGION(-1);                               \
+    VPY_CHECKREGIONOPEN(-1);                         \
+    if (value != NULL)                               \
+    {                                                \
+      VPY_CHECKVALUEREGION(-1);                      \
+    }                                                \
+    self->ob_type = type;                            \
+    rc = type->interface->name(self, key, value);    \
+    self->ob_type = isolated_type;                   \
+    return rc;                                       \
   }
-  else
-  {
-    VPY_CHECKVALUEREGION(-1);
-    rc = PySequence_SetItem(self, index, value);
+
+#define VPY_SSIZEARGFUNC(interface, name)          \
+  PyObject *Isolated_##name(PyObject *self,        \
+                            Py_ssize_t arg)        \
+  {                                                \
+    PyTypeObject *isolated_type = Py_TYPE(self);   \
+    VPY_GETTYPE(NULL);                             \
+    VPY_GETREGION(NULL);                           \
+    VPY_CHECKREGIONOPEN(NULL);                     \
+    self->ob_type = type;                          \
+    PyObject *result = type->interface->name(self, \
+                                             arg); \
+    self->ob_type = isolated_type;                 \
+    return result;                                 \
   }
-  self->ob_type = isolated_type;
 
-  return rc;
-}
+#define VPY_SSIZEOBJARGPROC(interface, name)           \
+  int Isolated_##name(PyObject *self,                  \
+                      Py_ssize_t arg, PyObject *value) \
+  {                                                    \
+    PyTypeObject *isolated_type = Py_TYPE(self);       \
+    int rc;                                            \
+    VPY_GETTYPE(-1);                                   \
+    VPY_GETREGION(-1);                                 \
+    VPY_CHECKREGIONOPEN(-1);                           \
+    if (value != NULL)                                 \
+    {                                                  \
+      VPY_CHECKVALUEREGION(-1);                        \
+    }                                                  \
+    self->ob_type = type;                              \
+    rc = type->interface->name(self, arg, value);      \
+    self->ob_type = isolated_type;                     \
+    return rc;                                         \
+  }
 
-static int Isolated_sq_contains(PyObject *self, PyObject *value)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-  VPY_GETREGION(-1);
-  VPY_CHECKREGIONOPEN(-1);
-  VPY_CHECKVALUEREGION(-1);
+#define VPY_OBJOBJPROC(interface, name)                \
+  int Isolated_##name(PyObject *self, PyObject *value) \
+  {                                                    \
+    PyTypeObject *isolated_type = Py_TYPE(self);       \
+    int rc;                                            \
+    VPY_GETTYPE(-1);                                   \
+    VPY_GETREGION(-1);                                 \
+    VPY_CHECKREGIONOPEN(-1);                           \
+    if (value != NULL)                                 \
+    {                                                  \
+      VPY_CHECKVALUEREGION(-1);                        \
+    }                                                  \
+    self->ob_type = type;                              \
+    rc = type->interface->name(self, value);           \
+    self->ob_type = isolated_type;                     \
+    return rc;                                         \
+  }
 
-  int rc;
-  self->ob_type = type;
-  value->ob_type = value_type;
-  rc = PySequence_Contains(self, value);
-  value->ob_type = value_isolated_type;
-  self->ob_type = isolated_type;
-  return rc;
-}
-
-static PyObject *Isolated_sq_inplace_concat(PyObject *self, PyObject *value)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
-  VPY_CHECKVALUEREGION(NULL);
-
-  PyObject *result;
-  self->ob_type = type;
-  value->ob_type = value_type;
-  result = PySequence_InPlaceConcat(self, value);
-  value->ob_type = value_isolated_type;
-  self->ob_type = isolated_type;
-  return result;
-}
-
-static PyObject *Isolated_sq_inplace_repeat(PyObject *self, Py_ssize_t num_times)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
-
-  PyObject *result;
-  self->ob_type = type;
-  result = PySequence_InPlaceRepeat(self, num_times);
-  self->ob_type = isolated_type;
-  return result;
-}
+VPY_LENFUNC(tp_as_mapping, mp_length)
+VPY_BINARYFUNC(tp_as_mapping, mp_subscript)
+VPY_OBJOBJARGPROC(tp_as_mapping, mp_ass_subscript);
+VPY_LENFUNC(tp_as_sequence, sq_length);
+VPY_BINARYFUNC(tp_as_sequence, sq_concat);
+VPY_SSIZEARGFUNC(tp_as_sequence, sq_repeat);
+VPY_SSIZEARGFUNC(tp_as_sequence, sq_item);
+VPY_SSIZEOBJARGPROC(tp_as_sequence, sq_ass_item);
+VPY_OBJOBJPROC(tp_as_sequence, sq_contains);
+VPY_BINARYFUNC(tp_as_sequence, sq_inplace_concat);
+VPY_SSIZEARGFUNC(tp_as_sequence, sq_inplace_repeat);
 
 static bool is_imm(PyObject *value)
 {
@@ -686,6 +620,9 @@ static int capture_object(RegionObject *region, PyObject *value)
         {0, NULL} /* Sentinel */
     };
 
+    const int num_mp_slots = 3;
+    const int num_sq_slots = 8;
+
     if (type->tp_as_mapping != NULL)
     {
       PyMappingMethods *map_methods = type->tp_as_mapping;
@@ -707,7 +644,7 @@ static int capture_object(RegionObject *region, PyObject *value)
     if (type->tp_as_sequence != NULL)
     {
       PySequenceMethods *seq_methods = type->tp_as_sequence;
-      PyType_Slot *seq_slots = slots + 3;
+      PyType_Slot *seq_slots = slots + num_mp_slots;
       if (seq_methods->sq_length != NULL)
       {
         seq_slots[0].pfunc = Isolated_sq_length;
