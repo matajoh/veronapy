@@ -4,7 +4,7 @@
 #include "structmember.h"
 #include <stdatomic.h>
 
-atomic_ullong region_identity = 1;
+atomic_ullong region_identity = 0;
 
 typedef long bool;
 #define true 1
@@ -44,6 +44,8 @@ typedef struct
   PyObject *__region__;
   PyObject *objects;
 } RegionObject;
+
+static RegionObject *implicit_region = NULL;
 
 static void Region_dealloc(RegionObject *self)
 {
@@ -236,6 +238,7 @@ static PyObject *Region_exit(RegionObject *self, PyObject *args,
   else
   {
     PyErr_Restore(type, value, traceback);
+    return NULL;
   }
 
   Py_RETURN_FALSE;
@@ -282,7 +285,7 @@ static PyObject *Isolated_repr(PyObject *self)
   if (region == NULL)
   {
     printf("error getting __region__");
-    return -1;
+    return NULL;
   }
 
   if (region->is_open)
@@ -354,7 +357,7 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
   if (isolated_type == NULL)
   {
     printf("error getting __isolated__");
-    return -1;
+    return NULL;
   }
 
   RegionObject *region = (RegionObject *)PyDict_GetItemString(
@@ -362,7 +365,7 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
   if (region == NULL)
   {
     printf("error getting __region__");
-    return -1;
+    return NULL;
   }
 
   if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
@@ -381,6 +384,172 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
 
   PyErr_SetString(PyExc_RuntimeError, "Region is not open");
   return NULL;
+}
+
+static RegionObject *region_of(PyObject *value)
+{
+  PyTypeObject *type = Py_TYPE(value);
+  RegionObject *region = (RegionObject *)PyDict_GetItemString(
+      type->tp_dict, "__region__");
+  if (region == NULL)
+  {
+    return implicit_region;
+  }
+
+  return region;
+}
+
+static int capture_object(RegionObject *region, PyObject *value);
+
+static int Isolated_setattro(PyObject *self, PyObject *attr_name,
+                             PyObject *value)
+{
+  int rc;
+
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
+      isolated_type->tp_dict, "__isolated__");
+  if (isolated_type == NULL)
+  {
+    printf("error getting __isolated__");
+    return -1;
+  }
+
+  RegionObject *region = (RegionObject *)PyDict_GetItemString(
+      isolated_type->tp_dict, "__region__");
+  if (region == NULL)
+  {
+    printf("error getting __region__");
+    return -1;
+  }
+
+  if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Cannot override region");
+    return -1;
+  }
+
+  if (!region->is_open)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    return -1;
+  }
+
+  RegionObject *value_region = region_of(value);
+  if (value_region == implicit_region)
+  {
+    capture_object(region, value);
+    value_region = region;
+  }
+
+  if (value_region == region)
+  {
+    self->ob_type = type;
+    rc = PyObject_GenericSetAttr(self, attr_name, value);
+    self->ob_type = isolated_type;
+    return rc;
+  }
+
+  PyErr_SetString(PyExc_RuntimeError, "Value belongs to another region");
+  return -1;
+}
+
+static bool is_imm(PyObject *value)
+{
+  if (Py_IsNone(value) || PyBool_Check(value) || PyLong_Check(value) || PyFloat_Check(value) || PyComplex_Check(value) || PyUnicode_Check(value) || PyBytes_Check(value) || PyRange_Check(value))
+  {
+    return true;
+  }
+
+  if (PyFrozenSet_Check(value) || PyTuple_Check(value))
+  {
+    Py_ssize_t i, len;
+    PyObject *seq = PySequence_List(value);
+    if (seq == NULL)
+    {
+      printf("Unable to enumerate over immutable sequence");
+      return false;
+    }
+
+    len = PySequence_Length(seq);
+    for (i = 0; i < len; i++)
+    {
+      PyObject *item = PySequence_GetItem(seq, i);
+      if (item == NULL)
+      {
+        printf("Unable to get item from sequence");
+        return false;
+      }
+
+      if (!is_imm(item))
+      {
+        Py_DECREF(item);
+        Py_DECREF(seq);
+        return false;
+      }
+
+      Py_DECREF(item);
+    }
+
+    Py_DECREF(seq);
+    return true;
+  }
+
+  return false;
+}
+
+static int capture_object(RegionObject *region, PyObject *value)
+{
+  int rc = 0;
+  PyTypeObject *type = Py_TYPE(value);
+  if (!is_imm(value))
+  {
+    PyType_Slot slots[] = {
+        {Py_tp_finalize, Isolated_finalize},
+        {Py_tp_repr, Isolated_repr},
+        {Py_tp_traverse, Isolated_traverse},
+        {Py_tp_clear, Isolated_clear},
+        {Py_tp_getattro, Isolated_getattro},
+        {Py_tp_setattro, Isolated_setattro},
+        {0, NULL} /* Sentinel */
+    };
+
+    PyType_Spec spec = {
+        .name = "region.isolated",
+        .basicsize = type->tp_basicsize,
+        .itemsize = type->tp_itemsize,
+        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HEAPTYPE,
+        .slots = slots,
+    };
+
+    PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
+    if (isolated_type == NULL)
+    {
+      printf("error creating isolated type");
+      return -1;
+    }
+
+    rc = PyDict_SetItemString(isolated_type->tp_dict, "__isolated__",
+                              (PyObject *)type);
+    if (rc < 0)
+    {
+      printf("error setting __isolated__");
+      return rc;
+    }
+
+    rc = PyDict_SetItemString(isolated_type->tp_dict, "__region__",
+                              (PyObject *)region);
+    if (rc < 0)
+    {
+      printf("error setting __region__");
+      return rc;
+    }
+
+    Py_INCREF((PyObject *)isolated_type);
+    value->ob_type = isolated_type;
+  }
+
+  return rc;
 }
 
 static PyObject *Region_getattro(RegionObject *self, PyObject *attr_name)
@@ -415,56 +584,28 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
     }
   }
 
-  PyTypeObject *type = Py_TYPE(value);
-  if ((type->tp_flags & Py_TPFLAGS_HEAPTYPE) != 0)
+  if (!self->is_open)
   {
-    PyType_Slot slots[] = {
-        {Py_tp_finalize, Isolated_finalize},
-        {Py_tp_repr, Isolated_repr},
-        {Py_tp_traverse, Isolated_traverse},
-        {Py_tp_clear, Isolated_clear},
-        {Py_tp_getattro, Isolated_getattro},
-        {0, NULL} /* Sentinel */
-    };
-
-    PyType_Spec spec = {
-        .name = "region.isolated",
-        .basicsize = type->tp_basicsize,
-        .itemsize = type->tp_itemsize,
-        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HEAPTYPE,
-        .slots = slots,
-    };
-
-    PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
-    if (isolated_type == NULL)
-    {
-      printf("error creating isolated type");
-      return -1;
-    }
-
-    rc = PyDict_SetItemString(isolated_type->tp_dict, "__isolated__",
-                              (PyObject *)type);
-    if (rc < 0)
-    {
-      printf("error setting __isolated__");
-      return rc;
-    }
-
-    rc = PyDict_SetItemString(isolated_type->tp_dict, "__region__",
-                              (PyObject *)self);
-    if (rc < 0)
-    {
-      printf("error setting __region__");
-      return rc;
-    }
-
-    Py_INCREF((PyObject *)isolated_type);
-    value->ob_type = isolated_type;
+    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    return -1;
   }
 
-  Py_INCREF(value);
-  rc = PyDict_SetItem(self->objects, attr_name, value);
-  return rc;
+  RegionObject *value_region = region_of(value);
+  if (value_region == implicit_region)
+  {
+    capture_object(self, value);
+    value_region = self;
+  }
+
+  if (value_region == self)
+  {
+    Py_INCREF(value);
+    rc = PyDict_SetItem(self->objects, attr_name, value);
+    return rc;
+  }
+
+  PyErr_SetString(PyExc_RuntimeError, "Value belongs to another region");
+  return -1;
 }
 
 static PyTypeObject RegionType = {
@@ -501,6 +642,22 @@ PyMODINIT_FUNC PyInit_veronapy(void)
     Py_DECREF(veronapymodule);
     return NULL;
   }
+
+  /* Pass two arguments, a string and an int. */
+  PyObject *argList = Py_BuildValue("(s)", "__implicit__");
+
+  /* Call the class object. */
+  implicit_region = (RegionObject *)PyObject_CallObject((PyObject *)&RegionType, argList);
+  if (implicit_region == NULL)
+  {
+    Py_DECREF(argList);
+    Py_DECREF(&RegionType);
+    Py_DECREF(veronapymodule);
+    return NULL;
+  }
+
+  /* Release the argument list. */
+  Py_DECREF(argList);
 
   return veronapymodule;
 }
