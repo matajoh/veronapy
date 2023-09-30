@@ -10,6 +10,22 @@ typedef long bool;
 #define true 1
 #define false 0
 
+#define VPY_GETTYPE(r)                                                                               \
+  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(isolated_type->tp_dict, "__isolated__"); \
+  if (type == NULL)                                                                                  \
+  {                                                                                                  \
+    PyErr_SetString(PyExc_TypeError, "error obtaining internal type of isolated object");            \
+    return r;                                                                                        \
+  }
+
+#define VPY_GETREGION(r)                                                                             \
+  RegionObject *region = (RegionObject *)PyDict_GetItemString(isolated_type->tp_dict, "__region__"); \
+  if (region == NULL)                                                                                \
+  {                                                                                                  \
+    PyErr_SetString(PyExc_TypeError, "error obtaining region of isolated object");                   \
+    return r;                                                                                        \
+  }
+
 static const char *REGION_ATTRS[] = {
     "name",
     "__identity__",
@@ -257,14 +273,7 @@ static PyMethodDef Region_methods[] = {
 static void Isolated_finalize(PyObject *self)
 {
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__isolated__");
-  if (isolated_type == NULL)
-  {
-    printf("error getting __isolated__");
-    return;
-  }
-
+  VPY_GETTYPE();
   self->ob_type = type;
   Py_DECREF(isolated_type);
 }
@@ -272,21 +281,8 @@ static void Isolated_finalize(PyObject *self)
 static PyObject *Isolated_repr(PyObject *self)
 {
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__isolated__");
-  if (isolated_type == NULL)
-  {
-    printf("error getting __isolated__");
-    return NULL;
-  }
-
-  RegionObject *region = (RegionObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__region__");
-  if (region == NULL)
-  {
-    printf("error getting __region__");
-    return NULL;
-  }
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
 
   if (region->is_open)
   {
@@ -304,13 +300,7 @@ static int Isolated_traverse(PyObject *self, visitproc visit, void *arg)
 {
   int rc;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__isolated__");
-  if (isolated_type == NULL)
-  {
-    printf("error getting __isolated__");
-    return -1;
-  }
+  VPY_GETTYPE(-1);
 
   traverseproc tp_traverse = type->tp_traverse;
   if (tp_traverse != NULL)
@@ -329,13 +319,7 @@ static int Isolated_clear(PyObject *self)
   int rc;
 
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__isolated__");
-  if (isolated_type == NULL)
-  {
-    printf("error getting __isolated__");
-    return -1;
-  }
+  VPY_GETTYPE(-1);
 
   inquiry tp_clear = type->tp_clear;
   if (tp_clear != NULL)
@@ -352,21 +336,8 @@ static int Isolated_clear(PyObject *self)
 static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
 {
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__isolated__");
-  if (isolated_type == NULL)
-  {
-    printf("error getting __isolated__");
-    return NULL;
-  }
-
-  RegionObject *region = (RegionObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__region__");
-  if (region == NULL)
-  {
-    printf("error getting __region__");
-    return NULL;
-  }
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
 
   if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
   {
@@ -388,9 +359,8 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
 
 static RegionObject *region_of(PyObject *value)
 {
-  PyTypeObject *type = Py_TYPE(value);
-  RegionObject *region = (RegionObject *)PyDict_GetItemString(
-      type->tp_dict, "__region__");
+  PyTypeObject *isolated_type = Py_TYPE(value);
+  RegionObject *region = (RegionObject *)PyDict_GetItemString(isolated_type->tp_dict, "__region__");
   if (region == NULL)
   {
     return implicit_region;
@@ -407,21 +377,8 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
   int rc;
 
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__isolated__");
-  if (isolated_type == NULL)
-  {
-    printf("error getting __isolated__");
-    return -1;
-  }
-
-  RegionObject *region = (RegionObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__region__");
-  if (region == NULL)
-  {
-    printf("error getting __region__");
-    return -1;
-  }
+  VPY_GETTYPE(-1);
+  VPY_GETREGION(-1);
 
   if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
   {
@@ -467,7 +424,7 @@ static bool is_imm(PyObject *value)
     PyObject *seq = PySequence_List(value);
     if (seq == NULL)
     {
-      printf("Unable to enumerate over immutable sequence");
+      PyErr_SetString(PyExc_RuntimeError, "Unable to enumerate over sequence");
       return false;
     }
 
@@ -477,7 +434,7 @@ static bool is_imm(PyObject *value)
       PyObject *item = PySequence_GetItem(seq, i);
       if (item == NULL)
       {
-        printf("Unable to get item from sequence");
+        PyErr_SetString(PyExc_RuntimeError, "Unable to get item from sequence");
         return false;
       }
 
@@ -525,7 +482,7 @@ static int capture_object(RegionObject *region, PyObject *value)
     PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
     if (isolated_type == NULL)
     {
-      printf("error creating isolated type");
+      PyErr_SetString(PyExc_TypeError, "error creating isolated type");
       return -1;
     }
 
@@ -533,7 +490,7 @@ static int capture_object(RegionObject *region, PyObject *value)
                               (PyObject *)type);
     if (rc < 0)
     {
-      printf("error setting __isolated__");
+      PyErr_SetString(PyExc_TypeError, "error adding internal type to isolated type dictionary");
       return rc;
     }
 
@@ -541,7 +498,7 @@ static int capture_object(RegionObject *region, PyObject *value)
                               (PyObject *)region);
     if (rc < 0)
     {
-      printf("error setting __region__");
+      PyErr_SetString(PyExc_TypeError, "error adding region to isolated type dictionary");
       return rc;
     }
 
@@ -560,6 +517,12 @@ static PyObject *Region_getattro(RegionObject *self, PyObject *attr_name)
     {
       return PyObject_GenericGetAttr((PyObject *)self, attr_name);
     }
+  }
+
+  if (!self->is_open)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    return NULL;
   }
 
   PyObject *obj = PyDict_GetItemWithError(self->objects, attr_name);
