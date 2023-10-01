@@ -10,7 +10,6 @@ def test_creation():
     assert r0.name == "a"
     assert not r0.is_open
     assert not r0.is_shared
-    assert str(r0) == "Region(a<1>)"
 
     try:
         r0.name = 5

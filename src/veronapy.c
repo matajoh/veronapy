@@ -41,25 +41,46 @@ typedef long bool;
     return r;                                                  \
   }
 
-#define VPY_CHECKVALUEREGION(r)                                             \
-  PyTypeObject *value_type = Py_TYPE(value);                                \
-  PyTypeObject *value_isolated_type = value_type;                           \
-  RegionObject *value_region = region_of(value);                            \
-  if (value_region == implicit_region)                                      \
-  {                                                                         \
-    value_type = value_isolated_type;                                       \
-    capture_object(region, value);                                          \
-    value_region = region;                                                  \
-    value_isolated_type = Py_TYPE(value);                                   \
-  }                                                                         \
-  else if (value_region == region)                                          \
-  {                                                                         \
-    _VPY_GETTYPE(value_type, value_isolated_type, r);                       \
-  }                                                                         \
-  else                                                                      \
-  {                                                                         \
-    PyErr_SetString(PyExc_RuntimeError, "Value belongs to another region"); \
-    return r;                                                               \
+#define VPY_CHECKARG0REGION(r)                                                       \
+  PyTypeObject *arg0_type = Py_TYPE(arg0);                                           \
+  PyTypeObject *arg0_isolated_type = arg0_type;                                      \
+  RegionObject *arg0_region = region_of(arg0);                                       \
+  if (arg0_region == implicit_region)                                                \
+  {                                                                                  \
+    arg0_type = arg0_isolated_type;                                                  \
+    capture_object(region, arg0);                                                    \
+    arg0_region = region;                                                            \
+    arg0_isolated_type = Py_TYPE(arg0);                                              \
+  }                                                                                  \
+  else if (arg0_region == region)                                                    \
+  {                                                                                  \
+    _VPY_GETTYPE(arg0_type, arg0_isolated_type, r);                                  \
+  }                                                                                  \
+  else                                                                               \
+  {                                                                                  \
+    PyErr_SetString(PyExc_RuntimeError, "First argument belongs to another region"); \
+    return r;                                                                        \
+  }
+
+#define VPY_CHECKARG1REGION(r)                                                        \
+  PyTypeObject *arg1_type = Py_TYPE(arg1);                                            \
+  PyTypeObject *arg1_isolated_type = arg1_type;                                       \
+  RegionObject *arg1_region = region_of(arg1);                                        \
+  if (arg1_region == implicit_region)                                                 \
+  {                                                                                   \
+    arg1_type = arg1_isolated_type;                                                   \
+    capture_object(region, arg1);                                                     \
+    arg1_region = region;                                                             \
+    arg1_isolated_type = Py_TYPE(arg1);                                               \
+  }                                                                                   \
+  else if (arg1_region == region)                                                     \
+  {                                                                                   \
+    _VPY_GETTYPE(arg1_type, arg1_isolated_type, r);                                   \
+  }                                                                                   \
+  else                                                                                \
+  {                                                                                   \
+    PyErr_SetString(PyExc_RuntimeError, "Second argument belongs to another region"); \
+    return r;                                                                         \
   }
 
 static const char *REGION_ATTRS[] = {
@@ -408,7 +429,7 @@ static RegionObject *region_of(PyObject *value)
 static int capture_object(RegionObject *region, PyObject *value);
 
 static int Isolated_setattro(PyObject *self, PyObject *attr_name,
-                             PyObject *value)
+                             PyObject *arg0)
 {
   int rc;
 
@@ -428,61 +449,109 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
     return -1;
   }
 
-  VPY_CHECKVALUEREGION(-1);
+  VPY_CHECKARG0REGION(-1);
 
   self->ob_type = type;
-  rc = PyObject_GenericSetAttr(self, attr_name, value);
+  rc = PyObject_GenericSetAttr(self, attr_name, arg0);
   self->ob_type = isolated_type;
   return rc;
 }
 
-#define VPY_LENFUNC(interface, name)               \
-  Py_ssize_t Isolated_##name(PyObject *self)       \
-  {                                                \
-    PyTypeObject *isolated_type = Py_TYPE(self);   \
-    VPY_GETTYPE(0);                                \
-    VPY_GETREGION(0);                              \
-    VPY_CHECKREGIONOPEN(0);                        \
-    self->ob_type = type;                          \
-    Py_ssize_t size = type->interface->name(self); \
-    self->ob_type = isolated_type;                 \
-    return size;                                   \
-  }
-
-#define VPY_BINARYFUNC(interface, name)                      \
-  PyObject *Isolated_##name(PyObject *self, PyObject *value) \
-  {                                                          \
-    PyTypeObject *isolated_type = Py_TYPE(self);             \
-    VPY_GETTYPE(NULL);                                       \
-    VPY_GETREGION(NULL);                                     \
-    VPY_CHECKREGIONOPEN(NULL);                               \
-    if (value != NULL)                                       \
-    {                                                        \
-      VPY_CHECKVALUEREGION(NULL);                            \
-    }                                                        \
-    self->ob_type = type;                                    \
-    PyObject *result = type->interface->name(self, value);   \
-    self->ob_type = isolated_type;                           \
-    return result;                                           \
-  }
-
-#define VPY_OBJOBJARGPROC(interface, name)           \
-  int Isolated_##name(PyObject *self, PyObject *key, \
-                      PyObject *value)               \
+#define VPY_LENFUNC(interface, name)                 \
+  Py_ssize_t Isolated_##name(PyObject *self)         \
   {                                                  \
     PyTypeObject *isolated_type = Py_TYPE(self);     \
-    int rc;                                          \
-    VPY_GETTYPE(-1);                                 \
-    VPY_GETREGION(-1);                               \
-    VPY_CHECKREGIONOPEN(-1);                         \
-    if (value != NULL)                               \
-    {                                                \
-      VPY_CHECKVALUEREGION(-1);                      \
-    }                                                \
+    VPY_GETTYPE(0);                                  \
+    VPY_GETREGION(0);                                \
+    VPY_CHECKREGIONOPEN(0);                          \
     self->ob_type = type;                            \
-    rc = type->interface->name(self, key, value);    \
+    Py_ssize_t length = type->interface->name(self); \
     self->ob_type = isolated_type;                   \
-    return rc;                                       \
+    return length;                                   \
+  }
+
+#define VPY_INQUIRY(interface, name)             \
+  int Isolated_##name(PyObject *self)            \
+  {                                              \
+    PyTypeObject *isolated_type = Py_TYPE(self); \
+    VPY_GETTYPE(0);                              \
+    VPY_GETREGION(0);                            \
+    VPY_CHECKREGIONOPEN(0);                      \
+    self->ob_type = type;                        \
+    int result = type->interface->name(self);    \
+    self->ob_type = isolated_type;               \
+    return result;                               \
+  }
+
+#define VPY_UNARYFUNC(interface, name)              \
+  PyObject *Isolated_##name(PyObject *self)         \
+  {                                                 \
+    PyTypeObject *isolated_type = Py_TYPE(self);    \
+    VPY_GETTYPE(NULL);                              \
+    VPY_GETREGION(NULL);                            \
+    VPY_CHECKREGIONOPEN(NULL);                      \
+    self->ob_type = type;                           \
+    PyObject *result = type->interface->name(self); \
+    self->ob_type = isolated_type;                  \
+    return result;                                  \
+  }
+
+#define VPY_BINARYFUNC(interface, name)                     \
+  PyObject *Isolated_##name(PyObject *self, PyObject *arg0) \
+  {                                                         \
+    PyTypeObject *isolated_type = Py_TYPE(self);            \
+    VPY_GETTYPE(NULL);                                      \
+    VPY_GETREGION(NULL);                                    \
+    VPY_CHECKREGIONOPEN(NULL);                              \
+    if (arg0 != NULL)                                       \
+    {                                                       \
+      VPY_CHECKARG0REGION(NULL);                            \
+    }                                                       \
+    self->ob_type = type;                                   \
+    PyObject *result = type->interface->name(self, arg0);   \
+    self->ob_type = isolated_type;                          \
+    return result;                                          \
+  }
+
+#define VPY_TERNARYFUNC(interface, name)                                    \
+  PyObject *Isolated_##name(PyObject *self, PyObject *arg0, PyObject *arg1) \
+  {                                                                         \
+    PyTypeObject *isolated_type = Py_TYPE(self);                            \
+    VPY_GETTYPE(NULL);                                                      \
+    VPY_GETREGION(NULL);                                                    \
+    VPY_CHECKREGIONOPEN(NULL);                                              \
+    if (arg0 != NULL)                                                       \
+    {                                                                       \
+      VPY_CHECKARG0REGION(NULL);                                            \
+    }                                                                       \
+    if (arg1 != NULL)                                                       \
+    {                                                                       \
+      VPY_CHECKARG1REGION(NULL);                                            \
+    }                                                                       \
+    self->ob_type = type;                                                   \
+    PyObject *result = type->interface->name(self, arg0, arg1);             \
+    self->ob_type = isolated_type;                                          \
+    return result;                                                          \
+  }
+
+#define VPY_OBJOBJARGPROC(interface, name)            \
+  int Isolated_##name(PyObject *self, PyObject *arg0, \
+                      PyObject *arg1)                 \
+  {                                                   \
+    PyTypeObject *isolated_type = Py_TYPE(self);      \
+    int rc;                                           \
+    VPY_GETTYPE(-1);                                  \
+    VPY_GETREGION(-1);                                \
+    VPY_CHECKREGIONOPEN(-1);                          \
+    VPY_CHECKARG0REGION(-1);                          \
+    if (arg1 != NULL)                                 \
+    {                                                 \
+      VPY_CHECKARG1REGION(-1);                        \
+    }                                                 \
+    self->ob_type = type;                             \
+    rc = type->interface->name(self, arg0, arg1);     \
+    self->ob_type = isolated_type;                    \
+    return rc;                                        \
   }
 
 #define VPY_SSIZEARGFUNC(interface, name)          \
@@ -502,39 +571,39 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
 
 #define VPY_SSIZEOBJARGPROC(interface, name)           \
   int Isolated_##name(PyObject *self,                  \
-                      Py_ssize_t arg, PyObject *value) \
+                      Py_ssize_t arg0, PyObject *arg1) \
   {                                                    \
     PyTypeObject *isolated_type = Py_TYPE(self);       \
     int rc;                                            \
     VPY_GETTYPE(-1);                                   \
     VPY_GETREGION(-1);                                 \
     VPY_CHECKREGIONOPEN(-1);                           \
-    if (value != NULL)                                 \
+    if (arg1 != NULL)                                  \
     {                                                  \
-      VPY_CHECKVALUEREGION(-1);                        \
+      VPY_CHECKARG1REGION(-1);                         \
     }                                                  \
     self->ob_type = type;                              \
-    rc = type->interface->name(self, arg, value);      \
+    rc = type->interface->name(self, arg0, arg1);      \
     self->ob_type = isolated_type;                     \
     return rc;                                         \
   }
 
-#define VPY_OBJOBJPROC(interface, name)                \
-  int Isolated_##name(PyObject *self, PyObject *value) \
-  {                                                    \
-    PyTypeObject *isolated_type = Py_TYPE(self);       \
-    int rc;                                            \
-    VPY_GETTYPE(-1);                                   \
-    VPY_GETREGION(-1);                                 \
-    VPY_CHECKREGIONOPEN(-1);                           \
-    if (value != NULL)                                 \
-    {                                                  \
-      VPY_CHECKVALUEREGION(-1);                        \
-    }                                                  \
-    self->ob_type = type;                              \
-    rc = type->interface->name(self, value);           \
-    self->ob_type = isolated_type;                     \
-    return rc;                                         \
+#define VPY_OBJOBJPROC(interface, name)               \
+  int Isolated_##name(PyObject *self, PyObject *arg0) \
+  {                                                   \
+    PyTypeObject *isolated_type = Py_TYPE(self);      \
+    int rc;                                           \
+    VPY_GETTYPE(-1);                                  \
+    VPY_GETREGION(-1);                                \
+    VPY_CHECKREGIONOPEN(-1);                          \
+    if (arg0 != NULL)                                 \
+    {                                                 \
+      VPY_CHECKARG0REGION(-1);                        \
+    }                                                 \
+    self->ob_type = type;                             \
+    rc = type->interface->name(self, arg0);           \
+    self->ob_type = isolated_type;                    \
+    return rc;                                        \
   }
 
 VPY_LENFUNC(tp_as_mapping, mp_length)
@@ -548,6 +617,41 @@ VPY_SSIZEOBJARGPROC(tp_as_sequence, sq_ass_item);
 VPY_OBJOBJPROC(tp_as_sequence, sq_contains);
 VPY_BINARYFUNC(tp_as_sequence, sq_inplace_concat);
 VPY_SSIZEARGFUNC(tp_as_sequence, sq_inplace_repeat);
+VPY_BINARYFUNC(tp_as_number, nb_add);
+VPY_BINARYFUNC(tp_as_number, nb_subtract);
+VPY_BINARYFUNC(tp_as_number, nb_multiply);
+VPY_BINARYFUNC(tp_as_number, nb_remainder);
+VPY_BINARYFUNC(tp_as_number, nb_divmod);
+VPY_TERNARYFUNC(tp_as_number, nb_power);
+VPY_UNARYFUNC(tp_as_number, nb_negative);
+VPY_UNARYFUNC(tp_as_number, nb_positive);
+VPY_UNARYFUNC(tp_as_number, nb_absolute);
+VPY_INQUIRY(tp_as_number, nb_bool);
+VPY_UNARYFUNC(tp_as_number, nb_invert);
+VPY_BINARYFUNC(tp_as_number, nb_lshift);
+VPY_BINARYFUNC(tp_as_number, nb_rshift);
+VPY_BINARYFUNC(tp_as_number, nb_and);
+VPY_BINARYFUNC(tp_as_number, nb_xor);
+VPY_BINARYFUNC(tp_as_number, nb_or);
+VPY_UNARYFUNC(tp_as_number, nb_int);
+VPY_UNARYFUNC(tp_as_number, nb_float);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_add);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_subtract);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_multiply);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_remainder);
+VPY_TERNARYFUNC(tp_as_number, nb_inplace_power);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_lshift);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_rshift);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_and);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_xor);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_or);
+VPY_BINARYFUNC(tp_as_number, nb_floor_divide);
+VPY_BINARYFUNC(tp_as_number, nb_true_divide);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_floor_divide);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_true_divide);
+VPY_UNARYFUNC(tp_as_number, nb_index);
+VPY_BINARYFUNC(tp_as_number, nb_matrix_multiply);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_matrix_multiply);
 
 static bool is_imm(PyObject *value)
 {
@@ -611,6 +715,41 @@ static int capture_object(RegionObject *region, PyObject *value)
         {Py_sq_contains, NULL},
         {Py_sq_inplace_concat, NULL},
         {Py_sq_inplace_repeat, NULL},
+        {Py_nb_add, NULL},
+        {Py_nb_subtract, NULL},
+        {Py_nb_multiply, NULL},
+        {Py_nb_remainder, NULL},
+        {Py_nb_divmod, NULL},
+        {Py_nb_power, NULL},
+        {Py_nb_negative, NULL},
+        {Py_nb_positive, NULL},
+        {Py_nb_absolute, NULL},
+        {Py_nb_bool, NULL},
+        {Py_nb_invert, NULL},
+        {Py_nb_lshift, NULL},
+        {Py_nb_rshift, NULL},
+        {Py_nb_and, NULL},
+        {Py_nb_xor, NULL},
+        {Py_nb_or, NULL},
+        {Py_nb_int, NULL},
+        {Py_nb_float, NULL},
+        {Py_nb_inplace_add, NULL},
+        {Py_nb_inplace_subtract, NULL},
+        {Py_nb_inplace_multiply, NULL},
+        {Py_nb_inplace_remainder, NULL},
+        {Py_nb_inplace_power, NULL},
+        {Py_nb_inplace_lshift, NULL},
+        {Py_nb_inplace_rshift, NULL},
+        {Py_nb_inplace_and, NULL},
+        {Py_nb_inplace_xor, NULL},
+        {Py_nb_inplace_or, NULL},
+        {Py_nb_floor_divide, NULL},
+        {Py_nb_true_divide, NULL},
+        {Py_nb_inplace_floor_divide, NULL},
+        {Py_nb_inplace_true_divide, NULL},
+        {Py_nb_index, NULL},
+        {Py_nb_matrix_multiply, NULL},
+        {Py_nb_inplace_matrix_multiply, NULL},
         {Py_tp_finalize, Isolated_finalize},
         {Py_tp_repr, Isolated_repr},
         {Py_tp_traverse, Isolated_traverse},
@@ -625,57 +764,203 @@ static int capture_object(RegionObject *region, PyObject *value)
 
     if (type->tp_as_mapping != NULL)
     {
-      PyMappingMethods *map_methods = type->tp_as_mapping;
-      PyType_Slot *map_slots = slots + 0;
-      if (map_methods->mp_length != NULL)
+      PyMappingMethods *mp_methods = type->tp_as_mapping;
+      PyType_Slot *mp_slots = slots + 0;
+      if (mp_methods->mp_length != NULL)
       {
-        map_slots[0].pfunc = Isolated_mp_length;
+        mp_slots[0].pfunc = Isolated_mp_length;
       }
-      if (map_methods->mp_subscript != NULL)
+      if (mp_methods->mp_subscript != NULL)
       {
-        map_slots[1].pfunc = Isolated_mp_subscript;
+        mp_slots[1].pfunc = Isolated_mp_subscript;
       }
-      if (map_methods->mp_ass_subscript != NULL)
+      if (mp_methods->mp_ass_subscript != NULL)
       {
-        map_slots[2].pfunc = Isolated_mp_ass_subscript;
+        mp_slots[2].pfunc = Isolated_mp_ass_subscript;
       }
     }
 
     if (type->tp_as_sequence != NULL)
     {
-      PySequenceMethods *seq_methods = type->tp_as_sequence;
-      PyType_Slot *seq_slots = slots + num_mp_slots;
-      if (seq_methods->sq_length != NULL)
+      PySequenceMethods *sq_methods = type->tp_as_sequence;
+      PyType_Slot *sq_slots = slots + num_mp_slots;
+      if (sq_methods->sq_length != NULL)
       {
-        seq_slots[0].pfunc = Isolated_sq_length;
+        sq_slots[0].pfunc = Isolated_sq_length;
       }
-      if (seq_methods->sq_concat != NULL)
+      if (sq_methods->sq_concat != NULL)
       {
-        seq_slots[1].pfunc = Isolated_sq_concat;
+        sq_slots[1].pfunc = Isolated_sq_concat;
       }
-      if (seq_methods->sq_repeat != NULL)
+      if (sq_methods->sq_repeat != NULL)
       {
-        seq_slots[2].pfunc = Isolated_sq_repeat;
+        sq_slots[2].pfunc = Isolated_sq_repeat;
       }
-      if (seq_methods->sq_item != NULL)
+      if (sq_methods->sq_item != NULL)
       {
-        seq_slots[3].pfunc = Isolated_sq_item;
+        sq_slots[3].pfunc = Isolated_sq_item;
       }
-      if (seq_methods->sq_ass_item != NULL)
+      if (sq_methods->sq_ass_item != NULL)
       {
-        seq_slots[4].pfunc = Isolated_sq_ass_item;
+        sq_slots[4].pfunc = Isolated_sq_ass_item;
       }
-      if (seq_methods->sq_contains != NULL)
+      if (sq_methods->sq_contains != NULL)
       {
-        seq_slots[5].pfunc = Isolated_sq_contains;
+        sq_slots[5].pfunc = Isolated_sq_contains;
       }
-      if (seq_methods->sq_inplace_concat != NULL)
+      if (sq_methods->sq_inplace_concat != NULL)
       {
-        seq_slots[6].pfunc = Isolated_sq_inplace_concat;
+        sq_slots[6].pfunc = Isolated_sq_inplace_concat;
       }
-      if (seq_methods->sq_inplace_repeat != NULL)
+      if (sq_methods->sq_inplace_repeat != NULL)
       {
-        seq_slots[7].pfunc = Isolated_sq_inplace_repeat;
+        sq_slots[7].pfunc = Isolated_sq_inplace_repeat;
+      }
+    }
+
+    if (type->tp_as_number != NULL)
+    {
+      PyNumberMethods *nb_methods = type->tp_as_number;
+      PyType_Slot *nb_slots = slots + num_mp_slots + num_sq_slots;
+      if (nb_methods->nb_add != NULL)
+      {
+        nb_slots[0].pfunc = Isolated_nb_add;
+      }
+      if (nb_methods->nb_subtract != NULL)
+      {
+        nb_slots[1].pfunc = Isolated_nb_subtract;
+      }
+      if (nb_methods->nb_multiply != NULL)
+      {
+        nb_slots[2].pfunc = Isolated_nb_multiply;
+      }
+      if (nb_methods->nb_remainder != NULL)
+      {
+        nb_slots[3].pfunc = Isolated_nb_remainder;
+      }
+      if (nb_methods->nb_divmod != NULL)
+      {
+        nb_slots[4].pfunc = Isolated_nb_divmod;
+      }
+      if (nb_methods->nb_power != NULL)
+      {
+        nb_slots[5].pfunc = Isolated_nb_power;
+      }
+      if (nb_methods->nb_negative != NULL)
+      {
+        nb_slots[6].pfunc = Isolated_nb_negative;
+      }
+      if (nb_methods->nb_positive != NULL)
+      {
+        nb_slots[7].pfunc = Isolated_nb_positive;
+      }
+      if (nb_methods->nb_absolute != NULL)
+      {
+        nb_slots[8].pfunc = Isolated_nb_absolute;
+      }
+      if (nb_methods->nb_bool != NULL)
+      {
+        nb_slots[9].pfunc = Isolated_nb_bool;
+      }
+      if (nb_methods->nb_invert != NULL)
+      {
+        nb_slots[10].pfunc = Isolated_nb_invert;
+      }
+      if (nb_methods->nb_lshift != NULL)
+      {
+        nb_slots[11].pfunc = Isolated_nb_lshift;
+      }
+      if (nb_methods->nb_rshift != NULL)
+      {
+        nb_slots[12].pfunc = Isolated_nb_rshift;
+      }
+      if (nb_methods->nb_and != NULL)
+      {
+        nb_slots[13].pfunc = Isolated_nb_and;
+      }
+      if (nb_methods->nb_xor != NULL)
+      {
+        nb_slots[14].pfunc = Isolated_nb_xor;
+      }
+      if (nb_methods->nb_or != NULL)
+      {
+        nb_slots[15].pfunc = Isolated_nb_or;
+      }
+      if (nb_methods->nb_int != NULL)
+      {
+        nb_slots[16].pfunc = Isolated_nb_int;
+      }
+      if (nb_methods->nb_float != NULL)
+      {
+        nb_slots[17].pfunc = Isolated_nb_float;
+      }
+      if (nb_methods->nb_inplace_add != NULL)
+      {
+        nb_slots[18].pfunc = Isolated_nb_inplace_add;
+      }
+      if (nb_methods->nb_inplace_subtract != NULL)
+      {
+        nb_slots[19].pfunc = Isolated_nb_inplace_subtract;
+      }
+      if (nb_methods->nb_inplace_multiply != NULL)
+      {
+        nb_slots[20].pfunc = Isolated_nb_inplace_multiply;
+      }
+      if (nb_methods->nb_inplace_remainder != NULL)
+      {
+        nb_slots[21].pfunc = Isolated_nb_inplace_remainder;
+      }
+      if (nb_methods->nb_inplace_power != NULL)
+      {
+        nb_slots[22].pfunc = Isolated_nb_inplace_power;
+      }
+      if (nb_methods->nb_inplace_lshift != NULL)
+      {
+        nb_slots[23].pfunc = Isolated_nb_inplace_lshift;
+      }
+      if (nb_methods->nb_inplace_rshift != NULL)
+      {
+        nb_slots[24].pfunc = Isolated_nb_inplace_rshift;
+      }
+      if (nb_methods->nb_inplace_and != NULL)
+      {
+        nb_slots[25].pfunc = Isolated_nb_inplace_and;
+      }
+      if (nb_methods->nb_inplace_xor != NULL)
+      {
+        nb_slots[26].pfunc = Isolated_nb_inplace_xor;
+      }
+      if (nb_methods->nb_inplace_or != NULL)
+      {
+        nb_slots[27].pfunc = Isolated_nb_inplace_or;
+      }
+      if (nb_methods->nb_floor_divide != NULL)
+      {
+        nb_slots[28].pfunc = Isolated_nb_floor_divide;
+      }
+      if (nb_methods->nb_true_divide != NULL)
+      {
+        nb_slots[29].pfunc = Isolated_nb_true_divide;
+      }
+      if (nb_methods->nb_inplace_floor_divide != NULL)
+      {
+        nb_slots[30].pfunc = Isolated_nb_inplace_floor_divide;
+      }
+      if (nb_methods->nb_inplace_true_divide != NULL)
+      {
+        nb_slots[31].pfunc = Isolated_nb_inplace_true_divide;
+      }
+      if (nb_methods->nb_index != NULL)
+      {
+        nb_slots[32].pfunc = Isolated_nb_index;
+      }
+      if (nb_methods->nb_matrix_multiply != NULL)
+      {
+        nb_slots[33].pfunc = Isolated_nb_matrix_multiply;
+      }
+      if (nb_methods->nb_inplace_matrix_multiply != NULL)
+      {
+        nb_slots[34].pfunc = Isolated_nb_inplace_matrix_multiply;
       }
     }
 
