@@ -49,9 +49,9 @@ def test_creation():
 def test_open():
     a = region("a")
     assert not a.is_open
-    a.__enter__()
-    assert a.is_open
-    a.__exit__(None, None, None)
+    with a:
+        assert a.is_open
+
     assert not a.is_open
 
 
@@ -100,3 +100,53 @@ def test_isolation():
         pass
     else:
         raise AssertionError
+
+
+def test_ownership_with_merging():
+    r1 = region()
+    r2 = region()
+
+    with r1, r2:
+        o1 = MockObject()      # free object
+        o2 = MockObject()      # free object
+        o1.f = o2              # o1 and o2 are in the same implicit region
+        r1.f = o1              # o1 becomes owned by r1, as does o2
+        try:
+            r2.f = o2          # Throws an exception as o2 is in r1
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError
+
+
+def skip_test_region_ownership():
+    r1 = region("r1")
+    r2 = region("r2")
+    r3 = region("r3")
+
+    with r1, r2:
+        r1.f = r3        # OK, r3 becomes owned by r1
+        try:
+            r2.f = r3    # Throws exception since r3 is already owned by r1
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError
+
+
+def skip_test_merge():
+    r1 = region()
+    r2 = region()
+
+    with r1:
+        r1.o1 = MockObject()
+        r1.o1.field = "r1"
+
+        with r2:
+            r2.o2 = MockObject()
+            r2.o2.field = "r2"
+
+        merged = r1.merge(r2)            # merge the two regions
+        r1.o2 = merged.o2                # create edges
+        print(r1.o2)                     # verify it exists
+        assert r2.o2.__region__ == r1    # validate r2 is an alias for r1

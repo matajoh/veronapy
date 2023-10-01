@@ -303,13 +303,13 @@ static PyObject *Region_exit(RegionObject *self, PyObject *args,
 
   if (type == Py_None)
   {
-    Py_XDECREF(type);
-    Py_XDECREF(value);
-    Py_XDECREF(traceback);
     self->is_open = false;
   }
   else
   {
+    Py_INCREF(type);
+    Py_INCREF(value);
+    Py_INCREF(traceback);
     PyErr_Restore(type, value, traceback);
     return NULL;
   }
@@ -700,6 +700,13 @@ static bool is_imm(PyObject *value)
 static int capture_object(RegionObject *region, PyObject *value)
 {
   int rc = 0;
+  // need to recurse into members
+  // 1. test as_seq and capture those
+  // 2. test as_mapping and capture those
+  // 3. enumerate __dict__ and grab everything that isn't a method
+  //    a. tb_methods/tb_members might be usable here
+  // only continue if all of these are clean
+
   PyTypeObject *type = Py_TYPE(value);
   if (!is_imm(value))
   {
@@ -979,6 +986,7 @@ static int capture_object(RegionObject *region, PyObject *value)
       return -1;
     }
 
+    Py_INCREF((PyObject *)isolated_type);
     rc = PyDict_SetItemString(isolated_type->tp_dict, "__isolated__",
                               (PyObject *)type);
     if (rc < 0)
@@ -987,6 +995,7 @@ static int capture_object(RegionObject *region, PyObject *value)
       return rc;
     }
 
+    Py_INCREF((PyObject *)region);
     rc = PyDict_SetItemString(isolated_type->tp_dict, "__region__",
                               (PyObject *)region);
     if (rc < 0)
@@ -1049,7 +1058,12 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
   RegionObject *value_region = region_of(value);
   if (value_region == implicit_region)
   {
-    capture_object(self, value);
+    rc = capture_object(self, value);
+    if (rc < 0)
+    {
+      return rc;
+    }
+
     value_region = self;
   }
 
