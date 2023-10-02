@@ -119,7 +119,7 @@ def test_ownership_with_merging():
             raise AssertionError
 
 
-def skip_test_region_ownership():
+def test_region_ownership():
     r1 = region("r1")
     r2 = region("r2")
     r3 = region("r3")
@@ -134,7 +134,7 @@ def skip_test_region_ownership():
             raise AssertionError
 
 
-def skip_test_merge():
+def test_merge():
     r1 = region()
     r2 = region()
 
