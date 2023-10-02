@@ -23,24 +23,31 @@ def test_creation():
 
     try:
         r0.__identity__ = 100
-    except TypeError:
+    except AttributeError:
         pass
     else:
-        raise AssertionError("Should have raised TypeError")
+        raise AssertionError("Should have raised AttributeError")
 
     try:
         r0.is_open = True
-    except TypeError:
+    except AttributeError:
         pass
     else:
-        raise AssertionError("Should have raised TypeError")
+        raise AssertionError("Should have raised AttributeError")
 
     try:
         r0.is_shared = True
-    except TypeError:
+    except AttributeError:
         pass
     else:
-        raise AssertionError("Should have raised TypeError")
+        raise AssertionError("Should have raised AttributeError")
+
+    try:
+        r1.parent = r0
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Should have raised AttributeError")
 
     assert r1.name == "b"
     assert r0.__identity__ != r1.__identity__
@@ -53,6 +60,20 @@ def test_open():
         assert a.is_open
 
     assert not a.is_open
+
+
+def test_parent():
+    a = region("a")
+    b = region("b")
+    with a:
+        a.child = b
+        assert b.parent == a
+        try:
+            b.parent = None
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("Should have raised RuntimeError")
 
 
 class MockObject:
