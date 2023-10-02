@@ -4,7 +4,9 @@
 #include "structmember.h"
 #include <stdatomic.h>
 
-atomic_ullong region_identity = 0;
+/***************************************************************/
+/*                     Macros and Defines                      */
+/***************************************************************/
 
 typedef long bool;
 #define true 1
@@ -44,237 +46,61 @@ typedef long bool;
     return r;                                                  \
   }
 
-#define VPY_CHECKARG0REGION(r)                                   \
-  PyTypeObject *arg0_type = Py_TYPE(arg0);                       \
-  PyTypeObject *arg0_isolated_type = arg0_type;                  \
-  RegionObject *arg0_region = region_of(arg0);                   \
-  if (arg0_region == implicit_region)                            \
-  {                                                              \
-    arg0_type = arg0_isolated_type;                              \
-    capture_object(region, arg0);                                \
-    arg0_region = region;                                        \
-    arg0_isolated_type = Py_TYPE(arg0);                          \
-  }                                                              \
-  else if (arg0_region == region)                                \
-  {                                                              \
-    _VPY_GETTYPE(arg0_type, arg0_isolated_type, r);              \
-  }                                                              \
-  else                                                           \
-  {                                                              \
-    PyErr_SetString(PyExc_RuntimeError,                          \
-                    "First argument belongs to another region"); \
-    return r;                                                    \
+#define VPY_CHECKARG0REGION(r)                                     \
+  PyTypeObject *arg0_type = Py_TYPE(arg0);                         \
+  PyTypeObject *arg0_isolated_type = arg0_type;                    \
+  RegionObject *arg0_region = region_of(arg0);                     \
+  if (arg0_region == NULL)                                         \
+  {                                                                \
+    PyErr_SetString(PyExc_RuntimeError,                            \
+                    "Unable to obtain region for first argument"); \
+    return r;                                                      \
+  }                                                                \
+  if (arg0_region == implicit_region)                              \
+  {                                                                \
+    arg0_type = arg0_isolated_type;                                \
+    capture_object(region, arg0);                                  \
+    arg0_region = region;                                          \
+    arg0_isolated_type = Py_TYPE(arg0);                            \
+  }                                                                \
+  else if (arg0_region == region)                                  \
+  {                                                                \
+    _VPY_GETTYPE(arg0_type, arg0_isolated_type, r);                \
+  }                                                                \
+  else                                                             \
+  {                                                                \
+    PyErr_SetString(PyExc_RuntimeError,                            \
+                    "First argument belongs to another region");   \
+    return r;                                                      \
   }
 
-#define VPY_CHECKARG1REGION(r)                                    \
-  PyTypeObject *arg1_type = Py_TYPE(arg1);                        \
-  PyTypeObject *arg1_isolated_type = arg1_type;                   \
-  RegionObject *arg1_region = region_of(arg1);                    \
-  if (arg1_region == implicit_region)                             \
-  {                                                               \
-    arg1_type = arg1_isolated_type;                               \
-    capture_object(region, arg1);                                 \
-    arg1_region = region;                                         \
-    arg1_isolated_type = Py_TYPE(arg1);                           \
-  }                                                               \
-  else if (arg1_region == region)                                 \
-  {                                                               \
-    _VPY_GETTYPE(arg1_type, arg1_isolated_type, r);               \
-  }                                                               \
-  else                                                            \
-  {                                                               \
-    PyErr_SetString(PyExc_RuntimeError,                           \
-                    "Second argument belongs to another region"); \
-    return r;                                                     \
+#define VPY_CHECKARG1REGION(r)                                      \
+  PyTypeObject *arg1_type = Py_TYPE(arg1);                          \
+  PyTypeObject *arg1_isolated_type = arg1_type;                     \
+  RegionObject *arg1_region = region_of(arg1);                      \
+  if (arg1_region == NULL)                                          \
+  {                                                                 \
+    PyErr_SetString(PyExc_RuntimeError,                             \
+                    "Unable to obtain region for second argument"); \
+    return r;                                                       \
+  }                                                                 \
+  if (arg1_region == implicit_region)                               \
+  {                                                                 \
+    arg1_type = arg1_isolated_type;                                 \
+    capture_object(region, arg1);                                   \
+    arg1_region = region;                                           \
+    arg1_isolated_type = Py_TYPE(arg1);                             \
+  }                                                                 \
+  else if (arg1_region == region)                                   \
+  {                                                                 \
+    _VPY_GETTYPE(arg1_type, arg1_isolated_type, r);                 \
+  }                                                                 \
+  else                                                              \
+  {                                                                 \
+    PyErr_SetString(PyExc_RuntimeError,                             \
+                    "Second argument belongs to another region");   \
+    return r;                                                       \
   }
-
-static const char *REGION_ATTRS[] = {
-    "name",
-    "__identity__",
-    "parent",
-    "is_open",
-    "merge",
-    "is_shared",
-    "__enter__",
-    "__exit__",
-    NULL,
-};
-
-static PyModuleDef veronapymoduledef = {
-    PyModuleDef_HEAD_INIT,
-    .m_name = "veronapy",
-    .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
-             "Concurrency runtime for Python.",
-    .m_size = -1,
-};
-
-static PyObject *veronapymodule = NULL;
-
-////// Region //////
-
-typedef struct
-{
-  PyObject_HEAD;
-  PyObject *name;
-  PyObject *alias;
-  unsigned long long __identity__;
-  bool is_open;
-  bool is_shared;
-  PyObject *parent;
-  PyObject *objects;
-  PyObject *types;
-} RegionObject;
-
-static RegionObject *implicit_region = NULL;
-static PyTypeObject *region_type = NULL;
-
-static bool is_free(RegionObject *region) { return region->parent == NULL; }
-
-static bool owns(RegionObject *lhs, RegionObject *rhs)
-{
-  if (lhs == rhs)
-  {
-    return true;
-  }
-
-  if (is_free(rhs))
-  {
-    return false;
-  }
-
-  return owns(lhs, (RegionObject *)rhs->parent);
-}
-
-static void Isolated_finalize(PyObject *self)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE();
-  self->ob_type = type;
-  Py_DECREF(isolated_type);
-}
-
-static PyObject *Isolated_repr(PyObject *self)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-
-  if (region->is_open)
-  {
-    self->ob_type = type;
-    PyObject *repr = PyObject_Repr(self);
-    self->ob_type = isolated_type;
-    return repr;
-  }
-
-  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
-  return NULL;
-}
-
-static int Isolated_traverse(PyObject *self, visitproc visit, void *arg)
-{
-  int rc;
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-
-  traverseproc tp_traverse = type->tp_traverse;
-  if (tp_traverse != NULL)
-  {
-    self->ob_type = type;
-    rc = tp_traverse(self, visit, arg);
-    self->ob_type = isolated_type;
-    return rc;
-  }
-
-  return 0;
-}
-
-static int Isolated_clear(PyObject *self)
-{
-  int rc;
-
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-
-  inquiry tp_clear = type->tp_clear;
-  if (tp_clear != NULL)
-  {
-    self->ob_type = type;
-    rc = tp_clear(self);
-    self->ob_type = isolated_type;
-    return rc;
-  }
-
-  return 0;
-}
-
-static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
-{
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-
-  if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
-  {
-    Py_INCREF(region);
-    return (PyObject *)region;
-  }
-
-  if (region->is_open)
-  {
-    self->ob_type = type;
-    PyObject *obj = PyObject_GenericGetAttr(self, attr_name);
-    self->ob_type = isolated_type;
-    return obj;
-  }
-
-  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
-  return NULL;
-}
-
-static RegionObject *region_of(PyObject *value)
-{
-  PyTypeObject *isolated_type = Py_TYPE(value);
-  RegionObject *region = (RegionObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__region__");
-  if (region == NULL)
-  {
-    return implicit_region;
-  }
-
-  return region;
-}
-
-static int capture_object(RegionObject *region, PyObject *value);
-
-static int Isolated_setattro(PyObject *self, PyObject *attr_name,
-                             PyObject *arg0)
-{
-  int rc;
-
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-  VPY_GETREGION(-1);
-
-  if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Cannot override region");
-    return -1;
-  }
-
-  if (!region->is_open)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
-    return -1;
-  }
-
-  VPY_CHECKARG0REGION(-1);
-
-  self->ob_type = type;
-  rc = PyObject_GenericSetAttr(self, attr_name, arg0);
-  self->ob_type = isolated_type;
-  return rc;
-}
 
 #define VPY_LENFUNC(interface, name)                 \
   Py_ssize_t Isolated_##name(PyObject *self)         \
@@ -421,52 +247,16 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
     return rc;                                        \
   }
 
-VPY_LENFUNC(tp_as_mapping, mp_length)
-VPY_BINARYFUNC(tp_as_mapping, mp_subscript)
-VPY_OBJOBJARGPROC(tp_as_mapping, mp_ass_subscript);
-VPY_LENFUNC(tp_as_sequence, sq_length);
-VPY_BINARYFUNC(tp_as_sequence, sq_concat);
-VPY_SSIZEARGFUNC(tp_as_sequence, sq_repeat);
-VPY_SSIZEARGFUNC(tp_as_sequence, sq_item);
-VPY_SSIZEOBJARGPROC(tp_as_sequence, sq_ass_item);
-VPY_OBJOBJPROC(tp_as_sequence, sq_contains);
-VPY_BINARYFUNC(tp_as_sequence, sq_inplace_concat);
-VPY_SSIZEARGFUNC(tp_as_sequence, sq_inplace_repeat);
-VPY_BINARYFUNC(tp_as_number, nb_add);
-VPY_BINARYFUNC(tp_as_number, nb_subtract);
-VPY_BINARYFUNC(tp_as_number, nb_multiply);
-VPY_BINARYFUNC(tp_as_number, nb_remainder);
-VPY_BINARYFUNC(tp_as_number, nb_divmod);
-VPY_TERNARYFUNC(tp_as_number, nb_power);
-VPY_UNARYFUNC(tp_as_number, nb_negative);
-VPY_UNARYFUNC(tp_as_number, nb_positive);
-VPY_UNARYFUNC(tp_as_number, nb_absolute);
-VPY_INQUIRY(tp_as_number, nb_bool);
-VPY_UNARYFUNC(tp_as_number, nb_invert);
-VPY_BINARYFUNC(tp_as_number, nb_lshift);
-VPY_BINARYFUNC(tp_as_number, nb_rshift);
-VPY_BINARYFUNC(tp_as_number, nb_and);
-VPY_BINARYFUNC(tp_as_number, nb_xor);
-VPY_BINARYFUNC(tp_as_number, nb_or);
-VPY_UNARYFUNC(tp_as_number, nb_int);
-VPY_UNARYFUNC(tp_as_number, nb_float);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_add);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_subtract);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_multiply);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_remainder);
-VPY_TERNARYFUNC(tp_as_number, nb_inplace_power);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_lshift);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_rshift);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_and);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_xor);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_or);
-VPY_BINARYFUNC(tp_as_number, nb_floor_divide);
-VPY_BINARYFUNC(tp_as_number, nb_true_divide);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_floor_divide);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_true_divide);
-VPY_UNARYFUNC(tp_as_number, nb_index);
-VPY_BINARYFUNC(tp_as_number, nb_matrix_multiply);
-VPY_BINARYFUNC(tp_as_number, nb_inplace_matrix_multiply);
+#define VPY_REGION(x)                   \
+  RegionObject *region = (x);           \
+  if (region->alias != (PyObject *)(x)) \
+  {                                     \
+    region = resolve_region(region);    \
+  }
+
+/***************************************************************/
+/*                     Useful functions                        */
+/***************************************************************/
 
 static bool is_imm(PyObject *value)
 {
@@ -514,9 +304,512 @@ static bool is_imm(PyObject *value)
   return false;
 }
 
+/***************************************************************/
+/*                     Module variables                        */
+/***************************************************************/
+
+static PyModuleDef veronapymoduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "veronapy",
+    .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
+             "Concurrency runtime for Python.",
+    .m_size = -1,
+};
+
+static PyObject *veronapymodule = NULL;
+atomic_ullong region_identity = 0;
+
+/***************************************************************/
+/*              Region struct and functions                    */
+/***************************************************************/
+
+typedef struct
+{
+  PyObject_HEAD;
+  PyObject *name;
+  PyObject *alias;
+  unsigned long long id;
+  bool is_open;
+  bool is_shared;
+  PyObject *parent;
+  PyObject *objects;
+  PyObject *types;
+} RegionObject;
+
+static RegionObject *implicit_region = NULL;
+static PyTypeObject *region_type = NULL;
+
+static const char *REGION_ATTRS[] = {
+    "name",
+    "id",
+    "parent",
+    "is_open",
+    "merge",
+    "is_shared",
+    "__enter__",
+    "__exit__",
+    NULL,
+};
+
+// Whether the given region is free, i.e. has no parent
+static bool is_free(RegionObject *region) { return region->parent == NULL; }
+
+// Whether lhs is the root of a tree that contains rhs
+static bool owns(RegionObject *lhs, RegionObject *rhs)
+{
+  if (lhs == rhs)
+  {
+    return true;
+  }
+
+  if (is_free(rhs))
+  {
+    return false;
+  }
+
+  return owns(lhs, (RegionObject *)rhs->parent);
+}
+
+// This returns the true region, skipping past aliases.
+static RegionObject *resolve_region(RegionObject *start)
+{
+  RegionObject *region = start;
+  while (region->alias != (PyObject *)region)
+  {
+    PyObject *alias = ((RegionObject *)region->alias)->alias;
+    Py_CLEAR(region->alias);
+    Py_INCREF(alias);
+    region->alias = (PyObject *)alias;
+
+    region = (RegionObject *)region->alias;
+  }
+
+  return region;
+}
+
+// The region of an object (or an implicit region if the object is not
+// isolated)
+static RegionObject *region_of(PyObject *value)
+{
+  PyTypeObject *isolated_type = Py_TYPE(value);
+  RegionObject *region = (RegionObject *)PyDict_GetItemString(
+      isolated_type->tp_dict, "__region__");
+  if (region == NULL)
+  {
+    return implicit_region;
+  }
+
+  if (region->alias != (PyObject *)region)
+  {
+    region = resolve_region(region);
+    if (PyDict_SetItemString(isolated_type->tp_dict, "__region__", (PyObject *)region) < 0)
+    {
+      return NULL;
+    }
+  }
+
+  return region;
+}
+
+static int capture_object(RegionObject *region, PyObject *value);
+
+// Attempts to capture all the items in a sequence into the given region
+static int capture_sequence(RegionObject *region, PyObject *sequence)
+{
+  PyObject *iterator = PyObject_GetIter(sequence);
+  PyObject *item;
+
+  if (iterator == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get iterator from sequence");
+    return -1;
+  }
+
+  while ((item = PyIter_Next(iterator)))
+  {
+    int rc;
+    if (item == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "Unable to get sequence item from iterator");
+      Py_DECREF(iterator);
+      return -1;
+    }
+
+    rc = capture_object(region, item);
+    if (rc != 0)
+    {
+      Py_DECREF(iterator);
+      Py_DECREF(item);
+      return rc;
+    }
+
+    Py_DECREF(item);
+  }
+
+  Py_DECREF(iterator);
+
+  if (PyErr_Occurred())
+  {
+    return -1;
+  }
+
+  return 0;
+}
+
+// Attempts to capture all the values in a mapping into the given region
+static int capture_mapping(RegionObject *region, PyObject *mapping)
+{
+  PyObject *values = PyMapping_Values(mapping);
+  if (values == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get values from mapping");
+    return -1;
+  }
+
+  int rc = capture_sequence(region, values);
+  Py_DECREF(values);
+  return rc;
+}
+
+static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type);
+
+// Attempts to capture an object into the given region.
+// This function will find all the types of all the objects
+// in the graph for which value is the root and capture them into the
+// region. If they have already been captured, it will use the type it
+// previously captured.
+static int capture_object(RegionObject *region, PyObject *value)
+{
+  PyTypeObject *isolated_type;
+  int rc = 0;
+  PyTypeObject *type = Py_TYPE(value);
+  RegionObject *value_region = region_of(value);
+
+  if (value_region == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to obtain region for value");
+    return -1;
+  }
+
+  if (is_imm(value) || value_region == region)
+  {
+    // this value is either immutable, or already captured by the region.
+    return 0;
+  }
+
+  if (value_region != implicit_region)
+  {
+    // this value is captured by another region
+    PyErr_SetString(PyExc_RuntimeError,
+                    "Object already captured by another region");
+    return -1;
+  }
+
+  if (value->ob_type == region_type)
+  {
+    // this is a region object, so we need to add it to our graph
+    RegionObject *child = (RegionObject *)value;
+    if (is_free(child))
+    {
+      Py_INCREF(region);
+      child->parent = (PyObject *)region;
+      return 0;
+    }
+    else if (!owns(region, child))
+    {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "Region already attached to a different region graph");
+      return -1;
+    }
+  }
+
+  if (PySequence_Check(value))
+  {
+    rc = capture_sequence(region, value);
+    if (rc != 0)
+    {
+      return rc;
+    }
+  }
+  else if (PyMapping_Check(value))
+  {
+    rc = capture_mapping(region, value);
+    if (rc != 0)
+    {
+      return rc;
+    }
+  }
+
+  if (PyObject_HasAttrString(value, "__dict__"))
+  {
+    PyObject *dict = PyObject_GetAttrString(value, "__dict__");
+    PyObject *values = PyDict_Values(dict);
+    if (values == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to get values from __dict__");
+      return -1;
+    }
+
+    rc = capture_sequence(region, values);
+    Py_DECREF(values);
+
+    if (rc != 0)
+    {
+      return rc;
+    }
+  }
+
+  isolated_type =
+      (PyTypeObject *)PyDict_GetItem(region->types, (PyObject *)type);
+  if (isolated_type == NULL)
+  {
+    isolated_type = isolate_type(region, type);
+    if (isolated_type == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to isolate type");
+      return -1;
+    }
+
+    rc = PyDict_SetItem(region->types, (PyObject *)type,
+                        (PyObject *)isolated_type);
+    if (rc < 0)
+    {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "Unable to add isolated type to region");
+      return -1;
+    }
+  }
+
+  Py_INCREF((PyObject *)isolated_type);
+  value->ob_type = isolated_type;
+
+  return rc;
+}
+
+/***************************************************************/
+/*              Isolated object methods                        */
+/***************************************************************/
+
+static void Isolated_finalize(PyObject *self)
+{
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE();
+  self->ob_type = type;
+  Py_DECREF(isolated_type);
+}
+
+static PyObject *Isolated_repr(PyObject *self)
+{
+  PyObject *repr;
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
+  VPY_CHECKREGIONOPEN(NULL);
+
+  self->ob_type = type;
+  repr = type->tp_repr(self);
+  self->ob_type = isolated_type;
+  return repr;
+}
+
+static PyObject *Isolated_str(PyObject *self)
+{
+  PyObject *str;
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
+  VPY_CHECKREGIONOPEN(NULL);
+
+  self->ob_type = type;
+  str = type->tp_str(self);
+  self->ob_type = isolated_type;
+  return str;
+}
+
+static PyObject *Isolated_iter(PyObject *self)
+{
+  PyObject *iter;
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
+  VPY_CHECKREGIONOPEN(NULL);
+
+  self->ob_type = type;
+  iter = type->tp_iter(self);
+  self->ob_type = isolated_type;
+  return iter;
+}
+
+static PyObject *Isolated_iternext(PyObject *self)
+{
+  PyObject *next;
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
+  VPY_CHECKREGIONOPEN(NULL);
+
+  self->ob_type = type;
+  next = type->tp_iternext(self);
+  self->ob_type = isolated_type;
+  return next;
+}
+
+static Py_hash_t Isolated_hash(PyObject *self)
+{
+  Py_hash_t hash;
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(0);
+  VPY_GETREGION(0);
+  VPY_CHECKREGIONOPEN(0);
+
+  self->ob_type = type;
+  hash = type->tp_hash(self);
+  self->ob_type = isolated_type;
+  return hash;
+}
+
+static int Isolated_traverse(PyObject *self, visitproc visit, void *arg)
+{
+  int rc;
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(-1);
+
+  self->ob_type = type;
+  rc = type->tp_traverse(self, visit, arg);
+  self->ob_type = isolated_type;
+  return rc;
+}
+
+static int Isolated_clear(PyObject *self)
+{
+  int rc;
+
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(-1);
+
+  self->ob_type = type;
+  rc = type->tp_clear(self);
+  self->ob_type = isolated_type;
+
+  return rc;
+}
+
+static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
+{
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(NULL);
+  VPY_GETREGION(NULL);
+
+  if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
+  {
+    Py_INCREF(region);
+    return (PyObject *)region;
+  }
+
+  if (region->is_open)
+  {
+    self->ob_type = type;
+    PyObject *obj = PyObject_GenericGetAttr(self, attr_name);
+    self->ob_type = isolated_type;
+    return obj;
+  }
+
+  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+  return NULL;
+}
+
+static int Isolated_setattro(PyObject *self, PyObject *attr_name,
+                             PyObject *arg0)
+{
+  int rc;
+
+  PyTypeObject *isolated_type = Py_TYPE(self);
+  VPY_GETTYPE(-1);
+  VPY_GETREGION(-1);
+
+  if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Cannot override region");
+    return -1;
+  }
+
+  if (!region->is_open)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    return -1;
+  }
+
+  VPY_CHECKARG0REGION(-1);
+
+  self->ob_type = type;
+  rc = PyObject_GenericSetAttr(self, attr_name, arg0);
+  self->ob_type = isolated_type;
+  return rc;
+}
+
+VPY_LENFUNC(tp_as_mapping, mp_length)
+VPY_BINARYFUNC(tp_as_mapping, mp_subscript)
+VPY_OBJOBJARGPROC(tp_as_mapping, mp_ass_subscript);
+VPY_LENFUNC(tp_as_sequence, sq_length);
+VPY_BINARYFUNC(tp_as_sequence, sq_concat);
+VPY_SSIZEARGFUNC(tp_as_sequence, sq_repeat);
+VPY_SSIZEARGFUNC(tp_as_sequence, sq_item);
+VPY_SSIZEOBJARGPROC(tp_as_sequence, sq_ass_item);
+VPY_OBJOBJPROC(tp_as_sequence, sq_contains);
+VPY_BINARYFUNC(tp_as_sequence, sq_inplace_concat);
+VPY_SSIZEARGFUNC(tp_as_sequence, sq_inplace_repeat);
+VPY_BINARYFUNC(tp_as_number, nb_add);
+VPY_BINARYFUNC(tp_as_number, nb_subtract);
+VPY_BINARYFUNC(tp_as_number, nb_multiply);
+VPY_BINARYFUNC(tp_as_number, nb_remainder);
+VPY_BINARYFUNC(tp_as_number, nb_divmod);
+VPY_TERNARYFUNC(tp_as_number, nb_power);
+VPY_UNARYFUNC(tp_as_number, nb_negative);
+VPY_UNARYFUNC(tp_as_number, nb_positive);
+VPY_UNARYFUNC(tp_as_number, nb_absolute);
+VPY_INQUIRY(tp_as_number, nb_bool);
+VPY_UNARYFUNC(tp_as_number, nb_invert);
+VPY_BINARYFUNC(tp_as_number, nb_lshift);
+VPY_BINARYFUNC(tp_as_number, nb_rshift);
+VPY_BINARYFUNC(tp_as_number, nb_and);
+VPY_BINARYFUNC(tp_as_number, nb_xor);
+VPY_BINARYFUNC(tp_as_number, nb_or);
+VPY_UNARYFUNC(tp_as_number, nb_int);
+VPY_UNARYFUNC(tp_as_number, nb_float);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_add);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_subtract);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_multiply);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_remainder);
+VPY_TERNARYFUNC(tp_as_number, nb_inplace_power);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_lshift);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_rshift);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_and);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_xor);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_or);
+VPY_BINARYFUNC(tp_as_number, nb_floor_divide);
+VPY_BINARYFUNC(tp_as_number, nb_true_divide);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_floor_divide);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_true_divide);
+VPY_UNARYFUNC(tp_as_number, nb_index);
+VPY_BINARYFUNC(tp_as_number, nb_matrix_multiply);
+VPY_BINARYFUNC(tp_as_number, nb_inplace_matrix_multiply);
+
+// Creates a new isolated type for the given type
+// The new type will wrap all of the methods of the given type
+// to enforce that the region containing an object of this
+// type is open. The resulting type will wrap a new type object
+// that is a copy of the given type object.
 static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
 {
   PyType_Slot slots[] = {
+      {Py_tp_repr, NULL},
+      {Py_tp_str, NULL},
+      {Py_tp_traverse, NULL},
+      {Py_tp_clear, NULL},
+      {Py_tp_hash, NULL},
+      {Py_tp_iter, NULL},
+      {Py_tp_iternext, NULL},
       {Py_mp_length, NULL},
       {Py_mp_subscript, NULL},
       {Py_mp_ass_subscript, NULL},
@@ -564,21 +857,48 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
       {Py_nb_matrix_multiply, NULL},
       {Py_nb_inplace_matrix_multiply, NULL},
       {Py_tp_finalize, Isolated_finalize},
-      {Py_tp_repr, Isolated_repr},
-      {Py_tp_traverse, Isolated_traverse},
-      {Py_tp_clear, Isolated_clear},
       {Py_tp_getattro, Isolated_getattro},
       {Py_tp_setattro, Isolated_setattro},
       {0, NULL} /* Sentinel */
   };
 
+  const int num_tp_slots = 7;
   const int num_mp_slots = 3;
   const int num_sq_slots = 8;
+
+  if (type->tp_repr != NULL)
+  {
+    slots[0].pfunc = Isolated_repr;
+  }
+  if (type->tp_str != NULL)
+  {
+    slots[1].pfunc = Isolated_str;
+  }
+  if (type->tp_traverse != NULL)
+  {
+    slots[2].pfunc = Isolated_traverse;
+  }
+  if (type->tp_clear != NULL)
+  {
+    slots[3].pfunc = Isolated_clear;
+  }
+  if (type->tp_hash != NULL)
+  {
+    slots[4].pfunc = Isolated_hash;
+  }
+  if (type->tp_iter != NULL)
+  {
+    slots[5].pfunc = Isolated_iter;
+  }
+  if (type->tp_iternext != NULL)
+  {
+    slots[6].pfunc = Isolated_iternext;
+  }
 
   if (type->tp_as_mapping != NULL)
   {
     PyMappingMethods *mp_methods = type->tp_as_mapping;
-    PyType_Slot *mp_slots = slots + 0;
+    PyType_Slot *mp_slots = slots + num_tp_slots;
     if (mp_methods->mp_length != NULL)
     {
       mp_slots[0].pfunc = Isolated_mp_length;
@@ -596,7 +916,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
   if (type->tp_as_sequence != NULL)
   {
     PySequenceMethods *sq_methods = type->tp_as_sequence;
-    PyType_Slot *sq_slots = slots + num_mp_slots;
+    PyType_Slot *sq_slots = slots + num_tp_slots + num_mp_slots;
     if (sq_methods->sq_length != NULL)
     {
       sq_slots[0].pfunc = Isolated_sq_length;
@@ -634,7 +954,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
   if (type->tp_as_number != NULL)
   {
     PyNumberMethods *nb_methods = type->tp_as_number;
-    PyType_Slot *nb_slots = slots + num_mp_slots + num_sq_slots;
+    PyType_Slot *nb_slots = slots + num_tp_slots + num_mp_slots + num_sq_slots;
     if (nb_methods->nb_add != NULL)
     {
       nb_slots[0].pfunc = Isolated_nb_add;
@@ -785,204 +1105,33 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
       .slots = slots,
   };
 
-  return (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
-}
-
-static int capture_sequence(RegionObject *region, PyObject *sequence)
-{
-  PyObject *iterator = PyObject_GetIter(sequence);
-  PyObject *item;
-
-  if (iterator == NULL)
+  PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
+  if (PyDict_SetItemString(isolated_type->tp_dict, "__isolated__",
+                           (PyObject *)type) < 0)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to get iterator from sequence");
-    return -1;
-  }
-
-  while ((item = PyIter_Next(iterator)))
-  {
-    int rc;
-    if (item == NULL)
-    {
-      PyErr_SetString(PyExc_RuntimeError,
-                      "Unable to get sequence item from iterator");
-      Py_DECREF(iterator);
-      return -1;
-    }
-
-    rc = capture_object(region, item);
-    if (rc != 0)
-    {
-      Py_DECREF(iterator);
-      Py_DECREF(item);
-      return rc;
-    }
-
-    Py_DECREF(item);
-  }
-
-  Py_DECREF(iterator);
-
-  if (PyErr_Occurred())
-  {
-    return -1;
-  }
-
-  return 0;
-}
-
-static int capture_mapping(RegionObject *region, PyObject *mapping)
-{
-  PyObject *values = PyMapping_Values(mapping);
-  if (values == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to get values from mapping");
-    return -1;
-  }
-
-  int rc = capture_sequence(region, values);
-  Py_DECREF(values);
-  return rc;
-}
-
-static int capture_object(RegionObject *region, PyObject *value)
-{
-  PyTypeObject *isolated_type;
-  int rc = 0;
-  PyTypeObject *type = Py_TYPE(value);
-
-  if (region->alias != NULL)
-  {
-    return capture_object((RegionObject *)region->alias, value);
-  }
-
-  printf("Capturing %s\n", value->ob_type->tp_name);
-
-  RegionObject *value_region = region_of(value);
-  if (is_imm(value) || value_region == region)
-  {
-    printf("Skipping (immutable or already captured)\n");
-    return 0;
-  }
-
-  if (value_region != implicit_region)
-  {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "Object already captured by another region");
-    return -1;
-  }
-
-  if (PySequence_Check(value))
-  {
-    printf("%s is a sequence\n", value->ob_type->tp_name);
-    rc = capture_sequence(region, value);
-    if (rc != 0)
-    {
-      return rc;
-    }
-  }
-  else if (PyMapping_Check(value))
-  {
-    printf("%s is a mapping\n", value->ob_type->tp_name);
-    rc = capture_mapping(region, value);
-    if (rc != 0)
-    {
-      return rc;
-    }
-  }
-
-  if (value->ob_type == region->ob_base.ob_type)
-  {
-    printf("is a region\n");
-    RegionObject *child = (RegionObject *)value;
-    if (is_free(child))
-    {
-      Py_INCREF(region);
-      child->parent = (PyObject *)region;
-    }
-    else if (!owns(region, child))
-    {
-      PyErr_SetString(PyExc_RuntimeError,
-                      "Region already attached to a different region graph");
-      return -1;
-    }
-  }
-
-  if (PyObject_HasAttrString(value, "__dict__"))
-  {
-    PyObject *dict = PyObject_GetAttrString(value, "__dict__");
-    PyObject_Print(dict, stdout, 0);
-    printf("\n");
-    PyObject *values = PyDict_Values(dict);
-    if (values == NULL)
-    {
-      printf("Unable to get values from __dict__\n");
-      PyErr_SetString(PyExc_RuntimeError, "Unable to get values from __dict__");
-      return -1;
-    }
-
-    rc = capture_sequence(region, values);
-    Py_DECREF(values);
-
-    if (rc != 0)
-    {
-      return rc;
-    }
-  }
-
-  isolated_type =
-      (PyTypeObject *)PyDict_GetItem(region->types, (PyObject *)type);
-  if (isolated_type == NULL)
-  {
-    printf("Isolating type %s\n", type->tp_name);
-    isolated_type = isolate_type(region, type);
-    if (isolated_type == NULL)
-    {
-      PyErr_SetString(PyExc_RuntimeError, "Unable to isolate type");
-      return -1;
-    }
-
-    rc = PyDict_SetItem(region->types, (PyObject *)type,
-                        (PyObject *)isolated_type);
-    if (rc < 0)
-    {
-      PyErr_SetString(PyExc_RuntimeError,
-                      "Unable to add isolated type to region");
-      return -1;
-    }
-  }
-  else
-  {
-    printf("Already isolated type %s\n", type->tp_name);
-  }
-
-  Py_INCREF((PyObject *)isolated_type);
-  rc = PyDict_SetItemString(isolated_type->tp_dict, "__isolated__",
-                            (PyObject *)type);
-  if (rc < 0)
-  {
+    Py_DECREF((PyObject *)isolated_type);
     PyErr_SetString(PyExc_TypeError,
                     "error adding internal type to isolated type dictionary");
-    return rc;
+    return NULL;
   }
 
   Py_INCREF((PyObject *)region);
-  rc = PyDict_SetItemString(isolated_type->tp_dict, "__region__",
-                            (PyObject *)region);
-  if (rc < 0)
+  if (PyDict_SetItemString(isolated_type->tp_dict, "__region__",
+                           (PyObject *)region) < 0)
   {
+    Py_DECREF((PyObject *)region);
+    Py_DECREF((PyObject *)isolated_type);
     PyErr_SetString(PyExc_TypeError,
                     "error adding region to isolated type dictionary");
-    return rc;
+    return NULL;
   }
 
-  printf("Replacing %s with isolated type\n", type->tp_name);
-
-  Py_INCREF((PyObject *)isolated_type);
-  value->ob_type = isolated_type;
-
-  return rc;
+  return isolated_type;
 }
+
+/***************************************************************/
+/*              Merge struct and methods                       */
+/***************************************************************/
 
 typedef struct
 {
@@ -1043,14 +1192,38 @@ static PyTypeObject MergeType = {
 
 static PyTypeObject *merge_type = NULL;
 
+/***************************************************************/
+/*              Region object methods                          */
+/***************************************************************/
+
+static int Region_clear(RegionObject *self)
+{
+  Py_CLEAR(self->objects);
+  Py_CLEAR(self->types);
+  Py_CLEAR(self->alias);
+  Py_CLEAR(self->parent);
+  return 0;
+}
+
 static void Region_dealloc(RegionObject *self)
 {
+  PyObject_GC_UnTrack(self);
+  Region_clear(self);
+  // Py_XDECREF(self->parent);
+  // Py_DECREF(self->objects);
+  // Py_DECREF(self->types);
+  // Py_DECREF(self->alias);
   Py_XDECREF(self->name);
-  Py_XDECREF(self->alias);
-  Py_XDECREF(self->parent);
-  Py_DECREF(self->objects);
-  Py_DECREF(self->types);
   Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static int Region_traverse(RegionObject *self, visitproc visit, void *arg)
+{
+  Py_VISIT(self->objects);
+  Py_VISIT(self->types);
+  Py_VISIT(self->alias);
+  Py_VISIT(self->parent);
+  return 0;
 }
 
 static PyObject *Region_new(PyTypeObject *type, PyObject *args,
@@ -1066,11 +1239,14 @@ static PyObject *Region_new(PyTypeObject *type, PyObject *args,
       Py_DECREF(self);
       return NULL;
     }
-    self->alias = NULL;
+
+    // The region is its own alias by default
+    Py_INCREF((PyObject *)self);
+    self->alias = (PyObject *)self;
     self->parent = NULL;
     self->is_open = false;
     self->is_shared = false;
-    self->__identity__ = 0;
+    self->id = 0;
     self->objects = PyDict_New();
     if (self->objects == NULL)
     {
@@ -1096,7 +1272,7 @@ static int Region_init(RegionObject *self, PyObject *args, PyObject *kwds)
   if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &name))
     return -1;
 
-  self->__identity__ = atomic_fetch_add(&region_identity, 1);
+  self->id = atomic_fetch_add(&region_identity, 1);
 
   if (name)
   {
@@ -1107,7 +1283,7 @@ static int Region_init(RegionObject *self, PyObject *args, PyObject *kwds)
   }
   else
   {
-    self->name = PyUnicode_FromFormat("region_%llu", self->__identity__);
+    self->name = PyUnicode_FromFormat("region_%llu", self->id);
     if (self->name == NULL)
     {
       Py_DECREF(self);
@@ -1120,12 +1296,14 @@ static int Region_init(RegionObject *self, PyObject *args, PyObject *kwds)
 
 static PyObject *Region_getname(RegionObject *self, void *closure)
 {
-  Py_INCREF(self->name);
-  return self->name;
+  VPY_REGION(self);
+  Py_INCREF(region->name);
+  return region->name;
 }
 
 static int Region_setname(RegionObject *self, PyObject *value, void *closure)
 {
+  VPY_REGION(self);
   PyObject *tmp;
   if (value == NULL)
   {
@@ -1140,43 +1318,48 @@ static int Region_setname(RegionObject *self, PyObject *value, void *closure)
     return -1;
   }
 
-  tmp = self->name;
+  tmp = region->name;
   Py_INCREF(value);
-  self->name = value;
+  region->name = value;
   Py_XDECREF(tmp);
   return 0;
 }
 
 static PyObject *Region_getidentity(RegionObject *self, void *closure)
 {
-  return PyLong_FromUnsignedLongLong(self->__identity__);
+  VPY_REGION(self);
+  return PyLong_FromUnsignedLongLong(region->id);
 }
 
 static PyObject *Region_getparent(RegionObject *self, void *closure)
 {
-  Py_INCREF(self->parent);
-  return self->parent;
+  VPY_REGION(self);
+  Py_INCREF(region->parent);
+  return region->parent;
 }
 
 static PyObject *Region_getisopen(RegionObject *self, void *closure)
 {
-  return PyBool_FromLong(self->is_open);
+  VPY_REGION(self);
+  return PyBool_FromLong(region->is_open);
 }
 
 static PyObject *Region_getisshared(RegionObject *self, void *closure)
 {
-  return PyBool_FromLong(self->is_shared);
+  VPY_REGION(self);
+  return PyBool_FromLong(region->is_shared);
 }
 
 static PyObject *Region_getisfree(RegionObject *self, void *closure)
 {
-  return PyBool_FromLong(is_free(self));
+  VPY_REGION(self);
+  return PyBool_FromLong(is_free(region));
 }
 
 static PyGetSetDef Region_getsetters[] = {
     {"name", (getter)Region_getname, (setter)Region_setname,
      "Human-readable name for the region", NULL},
-    {"__identity__", (getter)Region_getidentity, NULL,
+    {"id", (getter)Region_getidentity, NULL,
      "The immutable, unique identity for the region", NULL},
     {"parent", (getter)Region_getparent, NULL, "The parent region", NULL},
     {"is_open", (getter)Region_getisopen, NULL,
@@ -1195,11 +1378,7 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 {
   PyObject *arg;
   RegionObject *other;
-
-  if (self->alias != NULL)
-  {
-    return Region_merge((RegionObject *)self->alias, args, kwds);
-  }
+  VPY_REGION(self);
 
   if (!PyArg_ParseTuple(args, "O", &arg))
     return NULL;
@@ -1212,19 +1391,19 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 
   other = (RegionObject *)arg;
 
-  if (!self->is_open)
+  if (!region->is_open)
   {
     PyErr_SetString(PyExc_RuntimeError, "Region is not open");
     return NULL;
   }
 
-  if (!is_free(self))
+  if (!is_free(region))
   {
     PyErr_SetString(PyExc_RuntimeError, "Region is not free");
     return NULL;
   }
 
-  other->alias = (PyObject *)self;
+  other->alias = (PyObject *)region;
 
   PyObject *argList = Py_BuildValue("(O)", other->objects);
 
@@ -1241,34 +1420,38 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 
 static PyObject *Region_str(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
-  return PyUnicode_FromFormat("Region(%S<%d>)", self->name, self->__identity__);
+  VPY_REGION(self);
+  return PyUnicode_FromFormat("Region(%S<%d>)", region->name, region->id);
 }
 
 static PyObject *Region_repr(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
-  return PyUnicode_FromFormat("Region(%S<%d>%s%s)", self->name,
-                              self->__identity__, self->is_open ? " open" : "",
-                              self->is_shared ? " shared" : "");
+  VPY_REGION(self);
+  return PyUnicode_FromFormat("Region(%S<%d>%s%s)", region->name,
+                              region->id, region->is_open ? " open" : "",
+                              region->is_shared ? " shared" : "");
 }
 
 static PyObject *Region_enter(RegionObject *self,
                               PyObject *Py_UNUSED(ignored))
 {
-  self->is_open = true;
-  Py_INCREF((PyObject *)self);
-  return (PyObject *)self;
+  VPY_REGION(self);
+  region->is_open = true;
+  Py_INCREF((PyObject *)region);
+  return (PyObject *)region;
 }
 
 static PyObject *Region_exit(RegionObject *self, PyObject *args,
                              PyObject *kwds)
 {
+  VPY_REGION(self);
   PyObject *type, *value, *traceback;
   if (!PyArg_ParseTuple(args, "OOO", &type, &value, &traceback))
     return NULL;
 
   if (type == Py_None)
   {
-    self->is_open = false;
+    region->is_open = false;
   }
   else
   {
@@ -1294,21 +1477,22 @@ static PyMethodDef Region_methods[] = {
 
 static PyObject *Region_getattro(RegionObject *self, PyObject *attr_name)
 {
+  VPY_REGION(self);
   for (int i = 0; REGION_ATTRS[i] != NULL; i++)
   {
     if (strcmp(PyUnicode_AsUTF8(attr_name), REGION_ATTRS[i]) == 0)
     {
-      return PyObject_GenericGetAttr((PyObject *)self, attr_name);
+      return PyObject_GenericGetAttr((PyObject *)region, attr_name);
     }
   }
 
-  if (!self->is_open)
+  if (!region->is_open)
   {
     PyErr_SetString(PyExc_RuntimeError, "Region is not open");
     return NULL;
   }
 
-  PyObject *obj = PyDict_GetItemWithError(self->objects, attr_name);
+  PyObject *obj = PyDict_GetItemWithError(region->objects, attr_name);
   if (obj == NULL)
   {
     Py_RETURN_NONE;
@@ -1322,36 +1506,43 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
                            PyObject *value)
 {
   int rc;
+  VPY_REGION(self);
   for (int i = 0; REGION_ATTRS[i] != NULL; i++)
   {
     if (strcmp(PyUnicode_AsUTF8(attr_name), REGION_ATTRS[i]) == 0)
     {
-      return PyObject_GenericSetAttr((PyObject *)self, attr_name, value);
+      return PyObject_GenericSetAttr((PyObject *)region, attr_name, value);
     }
   }
 
-  if (!self->is_open)
+  if (!region->is_open)
   {
     PyErr_SetString(PyExc_RuntimeError, "Region is not open");
     return -1;
   }
 
   RegionObject *value_region = region_of(value);
+  if (value_region == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to obtain region of value");
+    return -1;
+  }
+
   if (value_region == implicit_region)
   {
-    rc = capture_object(self, value);
+    rc = capture_object(region, value);
     if (rc < 0)
     {
       return rc;
     }
 
-    value_region = self;
+    value_region = region;
   }
 
-  if (value_region == self)
+  if (value_region == region)
   {
     Py_INCREF(value);
-    rc = PyDict_SetItem(self->objects, attr_name, value);
+    rc = PyDict_SetItem(region->objects, attr_name, value);
     return rc;
   }
 
@@ -1364,7 +1555,7 @@ static PyTypeObject RegionType = {
     .tp_doc = PyDoc_STR("Region object"),
     .tp_basicsize = sizeof(RegionObject),
     .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
     .tp_new = Region_new,
     .tp_init = (initproc)Region_init,
     .tp_dealloc = (destructor)Region_dealloc,
@@ -1374,7 +1565,13 @@ static PyTypeObject RegionType = {
     .tp_str = (reprfunc)Region_str,
     .tp_setattro = (setattrofunc)Region_setattro,
     .tp_getattro = (getattrofunc)Region_getattro,
+    .tp_traverse = (traverseproc)Region_traverse,
+    .tp_clear = (inquiry)Region_clear,
 };
+
+/***************************************************************/
+/*                  Module setup                               */
+/***************************************************************/
 
 PyMODINIT_FUNC PyInit_veronapy(void)
 {
@@ -1411,7 +1608,6 @@ PyMODINIT_FUNC PyInit_veronapy(void)
 
   PyObject *argList = Py_BuildValue("(s)", "__implicit__");
 
-  /* Call the class object. */
   implicit_region =
       (RegionObject *)PyObject_CallObject((PyObject *)region_type, argList);
   if (implicit_region == NULL)
@@ -1422,7 +1618,6 @@ PyMODINIT_FUNC PyInit_veronapy(void)
     return NULL;
   }
 
-  /* Release the argument list. */
   Py_DECREF(argList);
 
   return veronapymodule;

@@ -22,7 +22,7 @@ def test_creation():
     assert r0.name == "c"
 
     try:
-        r0.__identity__ = 100
+        r0.id = 100
     except AttributeError:
         pass
     else:
@@ -50,7 +50,7 @@ def test_creation():
         raise AssertionError("Should have raised AttributeError")
 
     assert r1.name == "b"
-    assert r0.__identity__ != r1.__identity__
+    assert r0.id != r1.id
 
 
 def test_open():
