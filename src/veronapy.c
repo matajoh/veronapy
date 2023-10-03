@@ -1,13 +1,19 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <threads.h>
 
 #ifdef _WIN32
 #include <windows.h>
-typedef unsigned long long atomic_ullong;
+typedef long long atomic_llong;
 
-atomic_ullong atomic_fetch_add(atomic_ullong *ptr, atomic_ullong val)
+atomic_llong atomic_fetch_add(atomic_llong *ptr, atomic_llong val)
 {
   return InterlockedExchangeAdd64(ptr, val);
+}
+
+atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
+{
+  return InterlockedExchangeAdd64(ptr, -val);
 }
 #else
 #include <stdatomic.h>
@@ -317,7 +323,7 @@ static PyModuleDef veronapymoduledef = {
     .m_size = 0,
 };
 
-atomic_ullong region_identity = 0;
+atomic_llong region_identity = 0;
 
 /***************************************************************/
 /*              Region struct and functions                    */
@@ -328,12 +334,13 @@ typedef struct
   PyObject_HEAD
       PyObject *name;
   PyObject *alias;
-  unsigned long long id;
+  long long id;
   bool is_open;
   bool is_shared;
   PyObject *parent;
   PyObject *objects;
   PyObject *types;
+  atomic_intptr_t last;
 } RegionObject;
 
 static const char *REGION_ATTRS[] = {
@@ -575,6 +582,251 @@ static int capture_object(RegionObject *region, PyObject *value)
   value->ob_type = isolated_type;
 
   return rc;
+}
+
+static bool Region_Check(PyObject *obj);
+
+
+/***************************************************************/
+/*                   Behavior Implementation                   */
+/***************************************************************/
+
+typedef struct {
+  atomic_llong count;
+  atomic_bool set;
+  cnd_t condition;
+} Terminator;
+
+typedef struct {
+  volatile Behavior* next;
+  volatile bool scheduled;
+  RegionObject* target;
+} Request;
+
+typedef struct {
+  PyObject* thunk;
+  atomic_llong count;
+  Py_ssize_t length;
+  Request* requests;
+} Behavior;
+
+
+static Terminator* terminator;
+
+Terminator* Terminator_new()
+{
+  int rc;
+  Terminator* terminator = (Terminator*)PyMem_Malloc(sizeof(Terminator));
+  if (terminator == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate terminator");
+    return NULL;
+  }
+
+  terminator->count = 1;
+  rc = cnd_init(&terminator->condition);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize terminator condition");
+    return NULL;
+  }
+
+  return terminator;
+}
+
+void Terminator_increment(Terminator* terminator)
+{
+  atomic_fetch_add(&terminator->count, 1);
+}
+
+int Terminator_decrement(Terminator* terminator)
+{
+  int rc;
+  long long count = atomic_fetch_sub(&terminator->count, 1);
+  if (count == 0)
+  {
+    atomic_store(&terminator->set, true);
+    rc = cnd_broadcast (&terminator->condition); 
+    if (rc != thrd_success)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to broadcast terminator condition");
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int Terminator_wait(Terminator* terminator, mtx_t* mutex)
+{
+  int rc;
+  rc = Terminator_decrement(terminator);
+  if (rc != 0)
+  {
+    return rc;
+  }
+
+  if(atomic_load(&terminator->set))
+  {
+    return 0;
+  }
+
+  rc = cnd_wait(&terminator->condition, mutex);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to wait on terminator condition");
+    return -1;
+  }
+
+  return 0;
+}
+
+static void Request_init(Request* self, RegionObject* region);
+static void Request_free(Request* self);
+static void Request_release(Request* self);
+static void Request_start_enqueue(Request* self, Behavior* behavior);
+static void Request_finish_enqueue(Request* self);
+
+static Behavior* Behavior_new(PyObject* t, PyObject* regions)
+{
+  Py_ssize_t i;
+  Request* r;
+  Behavior* b = (Behavior*)PyMem_Malloc(sizeof(Behavior));
+  if (b == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate behavior");
+    return NULL;
+  }
+
+  Py_INCREF(t);
+  b->thunk = t;
+  PyList_Sort(regions);
+  b->length = PyList_Size(regions);
+  b->count = b->length + 1;
+  b->requests = (Request*)PyMem_Malloc(sizeof(Request) * b->length);
+  if (b->requests == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate requests");
+    return NULL;
+  }
+
+  for(i=0, r = b->requests; i < b->length; ++i, ++r){
+    PyObject* region = PyList_GetItem(regions, i);
+    if(region == NULL){
+      PyErr_SetString(PyExc_RuntimeError, "Unable to get region from list");
+      return NULL;
+    }
+
+    Request_init(r, (RegionObject*)region);
+  }
+}
+
+static Behavior* Behavior_free(Behavior* self)
+{
+  Py_ssize_t i;
+  Request* r;
+  Py_DECREF(self->thunk);
+  for(i=0; r=self->requests, i < self->length; ++i, ++r){
+    Request_free(r);
+  }
+
+  PyMem_Free(self->requests);
+}
+
+void Behavior_resolve_one(Behavior* self)
+{
+  Py_ssize_t i;
+  Request* r;
+  PyObject* result;
+  if(atomic_fetch_sub(&self->count, 1) != 0){
+    return;
+  }
+
+  // TODO this needs to run on a thread somehow
+  result = PyObject_CallObject(self->thunk, NULL);
+  if(result == NULL){
+    PyErr_SetString(PyExc_RuntimeError, "Unable to call behavior");
+    return;
+  }
+
+  Py_DECREF(result);
+  for(i=0, r=self->requests; i<self->length; ++i, ++r)
+  {
+    Request_release(r);
+  }
+
+  Terminator_decrement(terminator);
+}
+
+void Behavior_schedule(Behavior* self)
+{
+  Py_ssize_t i;
+  Request* r;
+  for(i=0, r=self->requests; i < self->length; ++i, ++r){
+    Request_start_enqueue(r, self);
+  }
+
+  for(i=0, r=self->requests; i < self->length; ++i, ++r){
+    Request_finish_enqueue(r);
+  }
+
+  Behavior_resolve_one(self);
+
+  Terminator_increment(terminator);
+}
+
+static void Request_init(Request* self, RegionObject* region)
+{
+  self->next = NULL;
+  self->scheduled = false;
+  Py_INCREF(region);
+  self->target = region;
+}
+
+static void Request_free(Request* self)
+{
+  Py_DECREF(self->target);
+}
+
+void Request_release(Request* self)
+{
+  intptr_t self_ptr = (intptr_t)self;
+  if(self->next == NULL){
+    if(atomic_compare_exchange_strong(&self->target->last, &self_ptr, NULL)){
+      return;
+    }
+
+    while(self->next == NULL)
+    {
+      thrd_yield();
+    }
+  }
+
+  Behavior_resolve_one(self->next);
+}
+
+void Request_start_enqueue(Request* self, Behavior* behavior)
+{
+  Request* prev;
+  intptr_t prev_ptr;
+  atomic_compare_exchange_strong(&self->target->last, &prev_ptr, (intptr_t)self);
+  if(prev_ptr == NULL)
+  {
+    Behavior_resolve_one(behavior);
+    return;
+  }
+
+  prev = (Request*)prev_ptr;
+  prev->next = behavior;
+
+  while(!prev->scheduled){
+    thrd_yield();
+  }
+}
+
+void Request_finish_enqueue(Request* self)
+{
+  self->scheduled = true;
 }
 
 /***************************************************************/
@@ -1367,8 +1619,6 @@ static PyGetSetDef Region_getsetters[] = {
      NULL},
     {NULL} /* Sentinel */
 };
-
-static bool Region_Check(PyObject *obj);
 
 static PyObject *Region_merge(RegionObject *self, PyObject *args,
                               PyObject *kwds)
