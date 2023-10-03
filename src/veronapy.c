@@ -567,7 +567,6 @@ static int capture_object(RegionObject *region, PyObject *value)
     isolated_type = isolate_type(region, type);
     if (isolated_type == NULL)
     {
-      PyErr_SetString(PyExc_RuntimeError, "Unable to isolate type");
       return -1;
     }
 
@@ -705,6 +704,11 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
   {
     Py_INCREF(region);
     return (PyObject *)region;
+  }
+
+  if (PyObject_HasAttr((PyObject *)isolated_type, attr_name))
+  {
+    return PyObject_GenericGetAttr(self, attr_name);
   }
 
   if (region->is_open)
@@ -1126,6 +1130,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
     return NULL;
   }
 
+  type->tp_flags = Py_TPFLAGS_IMMUTABLETYPE | type->tp_flags;
   return isolated_type;
 }
 
@@ -1209,10 +1214,6 @@ static void Region_dealloc(RegionObject *self)
 {
   PyObject_GC_UnTrack(self);
   Region_clear(self);
-  // Py_XDECREF(self->parent);
-  // Py_DECREF(self->objects);
-  // Py_DECREF(self->types);
-  // Py_DECREF(self->alias);
   Py_XDECREF(self->name);
   Py_TYPE(self)->tp_free((PyObject *)self);
 }

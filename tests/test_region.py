@@ -78,6 +78,7 @@ def test_parent():
 
 class MockObject:
     """Mock object used for testing."""
+
     def __str__(self) -> str:
         """Produces a simple representation of the object graph."""
         return json.dumps(self.__dict__)
@@ -171,3 +172,41 @@ def test_merge():
         r1.o2 = merged.o2                # create edges
         print(r1.o2)                     # verify it exists
         assert r2.o2.__region__ == r1    # validate r2 is an alias for r1
+
+
+def test_isolated_types():
+    r1 = region("r1")
+    r2 = region("r2")
+
+    class EmptyObject:
+        pass
+
+    def foo(self):
+        return "bar"
+
+    with r1:
+        r1.a = EmptyObject()
+        type(r1.a).foo = foo
+        assert r1.a.foo() == "bar"
+
+    with r2:
+        r2.b = EmptyObject()
+        r2.b.bar = 5
+        try:
+            r2.b.foo()  # should raise an attribute error
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError
+
+        merged = r2.merge(r1)  # merge r1 into r2
+        r2.a = merged.a
+        assert r2.a.foo() == "bar"
+        assert r2.b.bar == 5
+
+    try:
+        EmptyObject.baz = foo
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Should raise TypeError")
