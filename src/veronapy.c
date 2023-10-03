@@ -17,31 +17,35 @@ atomic_ullong atomic_fetch_add(atomic_ullong *ptr, atomic_ullong val)
 /*                     Macros and Defines                      */
 /***************************************************************/
 
+#if PY_VERSION_HEX < 0x030C0000 // Python 3.12
+#define PyType_GetDict(t) ((t)->tp_dict)
+#endif
+
 typedef long bool;
 #define true 1
 #define false 0
 
-#define _VPY_GETTYPE(n, i, r)                                            \
-  n = (PyTypeObject *)PyDict_GetItemString(i->tp_dict, "__isolated__");  \
-  if (n == NULL)                                                         \
-  {                                                                      \
-    PyErr_SetString(PyExc_TypeError,                                     \
-                    "error obtaining internal type of isolated object"); \
-    return r;                                                            \
+#define _VPY_GETTYPE(n, i, r)                                                  \
+  n = (PyTypeObject *)PyDict_GetItemString(PyType_GetDict(i), "__isolated__"); \
+  if (n == NULL)                                                               \
+  {                                                                            \
+    PyErr_SetString(PyExc_TypeError,                                           \
+                    "error obtaining internal type of isolated object");       \
+    return r;                                                                  \
   }
 
 #define VPY_GETTYPE(r) \
   PyTypeObject *type;  \
   _VPY_GETTYPE(type, isolated_type, r)
 
-#define _VPY_GETREGION(n, r)                                       \
-  n = (RegionObject *)PyDict_GetItemString(isolated_type->tp_dict, \
-                                           "__region__");          \
-  if (n == NULL)                                                   \
-  {                                                                \
-    PyErr_SetString(PyExc_TypeError,                               \
-                    "error obtaining region of isolated object");  \
-    return r;                                                      \
+#define _VPY_GETREGION(n, r)                                              \
+  n = (RegionObject *)PyDict_GetItemString(PyType_GetDict(isolated_type), \
+                                           "__region__");                 \
+  if (n == NULL)                                                          \
+  {                                                                       \
+    PyErr_SetString(PyExc_TypeError,                                      \
+                    "error obtaining region of isolated object");         \
+    return r;                                                             \
   }
 
 #define VPY_GETREGION(r) \
@@ -402,7 +406,7 @@ static RegionObject *region_of(PyObject *value)
 {
   PyTypeObject *isolated_type = Py_TYPE(value);
   RegionObject *region = (RegionObject *)PyDict_GetItemString(
-      isolated_type->tp_dict, "__region__");
+      PyType_GetDict(isolated_type), "__region__");
   if (region == NULL)
   {
     return implicit_region;
@@ -411,7 +415,7 @@ static RegionObject *region_of(PyObject *value)
   if (region->alias != (PyObject *)region)
   {
     region = resolve_region(region);
-    if (PyDict_SetItemString(isolated_type->tp_dict, "__region__", (PyObject *)region) < 0)
+    if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__region__", (PyObject *)region) < 0)
     {
       return NULL;
     }
@@ -602,12 +606,12 @@ static int capture_object(RegionObject *region, PyObject *value)
 static void Isolated_finalize(PyObject *self)
 {
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(isolated_type->tp_dict, "__isolated__");
-  if (type == NULL)                                                         
-  {                                                                      
-    PyErr_SetString(PyExc_TypeError,                                     
-                    "error obtaining internal type of isolated object"); 
-    return;                                                            
+  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(PyType_GetDict(isolated_type), "__isolated__");
+  if (type == NULL)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error obtaining internal type of isolated object");
+    return;
   }
 
   self->ob_type = type;
@@ -1126,7 +1130,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
   };
 
   PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
-  if (PyDict_SetItemString(isolated_type->tp_dict, "__isolated__",
+  if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__isolated__",
                            (PyObject *)type) < 0)
   {
     Py_DECREF((PyObject *)isolated_type);
@@ -1136,7 +1140,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
   }
 
   Py_INCREF((PyObject *)region);
-  if (PyDict_SetItemString(isolated_type->tp_dict, "__region__",
+  if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__region__",
                            (PyObject *)region) < 0)
   {
     Py_DECREF((PyObject *)region);
