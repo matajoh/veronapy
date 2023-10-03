@@ -1,25 +1,97 @@
 """Region tests."""
 
 import json
+from veronapy import region
 
-from veronapy import region, region_of, RegionIsolationError
+
+def test_creation():
+    r0 = region("a")
+    r1 = region("b")
+    assert r0.name == "a"
+    assert not r0.is_open
+    assert not r0.is_shared
+
+    try:
+        r0.name = 5
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Should have raised TypeError")
+
+    r0.name = "c"
+    assert r0.name == "c"
+
+    try:
+        r0.id = 100
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Should have raised AttributeError")
+
+    try:
+        r0.is_open = True
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Should have raised AttributeError")
+
+    try:
+        r0.is_shared = True
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Should have raised AttributeError")
+
+    try:
+        r1.parent = r0
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Should have raised AttributeError")
+
+    assert r1.name == "b"
+    assert r0.id != r1.id
+
+
+def test_open():
+    a = region("a")
+    assert not a.is_open
+    with a:
+        assert a.is_open
+
+    assert not a.is_open
+
+
+def test_parent():
+    a = region("a")
+    b = region("b")
+    with a:
+        a.child = b
+        assert b.parent == a
+        try:
+            b.parent = None
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("Should have raised RuntimeError")
 
 
 class MockObject:
     """Mock object used for testing."""
+
     def __str__(self) -> str:
         """Produces a simple representation of the object graph."""
         return json.dumps(self.__dict__)
 
 
-def test_creation():
+def test_adding():
     r = region()   # closed, free and private
     o = MockObject()  # free
 
     with r:
         r.f = o       # o becomes owned by r
 
-    assert region(o) == r
+    assert o.__region__ == r
 
 
 def test_ownership():
@@ -29,7 +101,7 @@ def test_ownership():
         r1.accounts = {"Alice": 1000}
         try:
             r2.accounts = r1.accounts
-        except RegionIsolationError:
+        except RuntimeError:
             # ownership exception
             pass
         else:
@@ -44,39 +116,12 @@ def test_isolation():
         x = r1.accounts
 
     try:
-        print(x["Alice"].balance)
-    except RegionIsolationError:
+        print(x["Alice"])
+    except RuntimeError:
         # the region not open
         pass
     else:
         raise AssertionError
-
-
-def test_with_shared():
-    r1 = region("Bank1").make_shareable()
-    try:
-        with r1:
-            r1.accounts = {"Alice": 1000}
-    except RegionIsolationError:
-        # shared region needs when
-        pass
-    else:
-        raise AssertionError
-
-
-def test_region_ownership():
-    r1 = region("r1")
-    r2 = region("r2")
-    r3 = region("r3")
-
-    with r1, r2:
-        r1.f = r3        # OK, r3 becomes owned by r1
-        try:
-            r2.f = r3    # Throws exception since r3 is already owned by r1
-        except RegionIsolationError:
-            pass
-        else:
-            raise AssertionError
 
 
 def test_ownership_with_merging():
@@ -90,7 +135,22 @@ def test_ownership_with_merging():
         r1.f = o1              # o1 becomes owned by r1, as does o2
         try:
             r2.f = o2          # Throws an exception as o2 is in r1
-        except RegionIsolationError:
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError
+
+
+def test_region_ownership():
+    r1 = region("r1")
+    r2 = region("r2")
+    r3 = region("r3")
+
+    with r1, r2:
+        r1.f = r3        # OK, r3 becomes owned by r1
+        try:
+            r2.f = r3    # Throws exception since r3 is already owned by r1
+        except RuntimeError:
             pass
         else:
             raise AssertionError
@@ -111,4 +171,42 @@ def test_merge():
         merged = r1.merge(r2)            # merge the two regions
         r1.o2 = merged.o2                # create edges
         print(r1.o2)                     # verify it exists
-        assert region_of(r2.o2) == r1       # validate r2 is an alias for r1
+        assert r2.o2.__region__ == r1    # validate r2 is an alias for r1
+
+
+def test_isolated_types():
+    r1 = region("r1")
+    r2 = region("r2")
+
+    class EmptyObject:
+        pass
+
+    def foo(self):
+        return "bar"
+
+    with r1:
+        r1.a = EmptyObject()
+        type(r1.a).foo = foo
+        assert r1.a.foo() == "bar"
+
+    with r2:
+        r2.b = EmptyObject()
+        r2.b.bar = 5
+        try:
+            r2.b.foo()  # should raise an attribute error
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError
+
+        merged = r2.merge(r1)  # merge r1 into r2
+        r2.a = merged.a
+        assert r2.a.foo() == "bar"
+        assert r2.b.bar == 5
+
+    try:
+        EmptyObject.baz = foo
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Should raise TypeError")
