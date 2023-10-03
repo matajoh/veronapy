@@ -1,8 +1,17 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include "structmember.h"
+#ifdef _WIN32
+#include <windows.h>
+typedef unsigned long long atomic_ullong;
+
+atomic_ullong atomic_fetch_add(atomic_ullong *ptr, atomic_ullong val)
+{
+  return InterlockedExchangeAdd64(ptr, val);
+}
+#else
 #include <stdatomic.h>
+#endif
 
 /***************************************************************/
 /*                     Macros and Defines                      */
@@ -325,7 +334,7 @@ atomic_ullong region_identity = 0;
 
 typedef struct
 {
-  PyObject_HEAD;
+  PyObject_HEAD
   PyObject *name;
   PyObject *alias;
   unsigned long long id;
@@ -593,7 +602,14 @@ static int capture_object(RegionObject *region, PyObject *value)
 static void Isolated_finalize(PyObject *self)
 {
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE();
+  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(isolated_type->tp_dict, "__isolated__");
+  if (type == NULL)                                                         
+  {                                                                      
+    PyErr_SetString(PyExc_TypeError,                                     
+                    "error obtaining internal type of isolated object"); 
+    return;                                                            
+  }
+
   self->ob_type = type;
   Py_DECREF(isolated_type);
 }
@@ -1103,8 +1119,8 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
 
   PyType_Spec spec = {
       .name = "region.isolated",
-      .basicsize = type->tp_basicsize,
-      .itemsize = type->tp_itemsize,
+      .basicsize = (int)type->tp_basicsize,
+      .itemsize = (int)type->tp_itemsize,
       .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HEAPTYPE,
       .slots = slots,
   };
@@ -1140,7 +1156,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
 
 typedef struct
 {
-  PyObject_HEAD;
+  PyObject_HEAD
   PyObject *objects;
 } MergeObject;
 
