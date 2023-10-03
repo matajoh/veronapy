@@ -59,60 +59,48 @@ typedef long bool;
     return r;                                                  \
   }
 
-#define VPY_CHECKARG0REGION(r)                                     \
-  PyTypeObject *arg0_type = Py_TYPE(arg0);                         \
-  PyTypeObject *arg0_isolated_type = arg0_type;                    \
-  RegionObject *arg0_region = region_of(arg0);                     \
-  if (arg0_region == NULL)                                         \
-  {                                                                \
-    PyErr_SetString(PyExc_RuntimeError,                            \
-                    "Unable to obtain region for first argument"); \
-    return r;                                                      \
-  }                                                                \
-  if (arg0_region == implicit_region)                              \
-  {                                                                \
-    arg0_type = arg0_isolated_type;                                \
-    capture_object(region, arg0);                                  \
-    arg0_region = region;                                          \
-    arg0_isolated_type = Py_TYPE(arg0);                            \
-  }                                                                \
-  else if (arg0_region == region)                                  \
-  {                                                                \
-    _VPY_GETTYPE(arg0_type, arg0_isolated_type, r);                \
-  }                                                                \
-  else                                                             \
-  {                                                                \
-    PyErr_SetString(PyExc_RuntimeError,                            \
-                    "First argument belongs to another region");   \
-    return r;                                                      \
+#define VPY_CHECKARG0REGION(r)                                   \
+  PyTypeObject *arg0_type = Py_TYPE(arg0);                       \
+  PyTypeObject *arg0_isolated_type = arg0_type;                  \
+  RegionObject *arg0_region = region_of(arg0);                   \
+  if (arg0_region == NULL)                                       \
+  {                                                              \
+    arg0_type = arg0_isolated_type;                              \
+    capture_object(region, arg0);                                \
+    arg0_region = region;                                        \
+    arg0_isolated_type = Py_TYPE(arg0);                          \
+  }                                                              \
+  else if (arg0_region == region)                                \
+  {                                                              \
+    _VPY_GETTYPE(arg0_type, arg0_isolated_type, r);              \
+  }                                                              \
+  else                                                           \
+  {                                                              \
+    PyErr_SetString(PyExc_RuntimeError,                          \
+                    "First argument belongs to another region"); \
+    return r;                                                    \
   }
 
-#define VPY_CHECKARG1REGION(r)                                      \
-  PyTypeObject *arg1_type = Py_TYPE(arg1);                          \
-  PyTypeObject *arg1_isolated_type = arg1_type;                     \
-  RegionObject *arg1_region = region_of(arg1);                      \
-  if (arg1_region == NULL)                                          \
-  {                                                                 \
-    PyErr_SetString(PyExc_RuntimeError,                             \
-                    "Unable to obtain region for second argument"); \
-    return r;                                                       \
-  }                                                                 \
-  if (arg1_region == implicit_region)                               \
-  {                                                                 \
-    arg1_type = arg1_isolated_type;                                 \
-    capture_object(region, arg1);                                   \
-    arg1_region = region;                                           \
-    arg1_isolated_type = Py_TYPE(arg1);                             \
-  }                                                                 \
-  else if (arg1_region == region)                                   \
-  {                                                                 \
-    _VPY_GETTYPE(arg1_type, arg1_isolated_type, r);                 \
-  }                                                                 \
-  else                                                              \
-  {                                                                 \
-    PyErr_SetString(PyExc_RuntimeError,                             \
-                    "Second argument belongs to another region");   \
-    return r;                                                       \
+#define VPY_CHECKARG1REGION(r)                                    \
+  PyTypeObject *arg1_type = Py_TYPE(arg1);                        \
+  PyTypeObject *arg1_isolated_type = arg1_type;                   \
+  RegionObject *arg1_region = region_of(arg1);                    \
+  if (arg1_region == NULL)                                        \
+  {                                                               \
+    arg1_type = arg1_isolated_type;                               \
+    capture_object(region, arg1);                                 \
+    arg1_region = region;                                         \
+    arg1_isolated_type = Py_TYPE(arg1);                           \
+  }                                                               \
+  else if (arg1_region == region)                                 \
+  {                                                               \
+    _VPY_GETTYPE(arg1_type, arg1_isolated_type, r);               \
+  }                                                               \
+  else                                                            \
+  {                                                               \
+    PyErr_SetString(PyExc_RuntimeError,                           \
+                    "Second argument belongs to another region"); \
+    return r;                                                     \
   }
 
 #define VPY_LENFUNC(interface, name)                 \
@@ -326,10 +314,9 @@ static PyModuleDef veronapymoduledef = {
     .m_name = "veronapy",
     .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
              "Concurrency runtime for Python.",
-    .m_size = -1,
+    .m_size = 0,
 };
 
-static PyObject *veronapymodule = NULL;
 atomic_ullong region_identity = 0;
 
 /***************************************************************/
@@ -339,7 +326,7 @@ atomic_ullong region_identity = 0;
 typedef struct
 {
   PyObject_HEAD
-  PyObject *name;
+      PyObject *name;
   PyObject *alias;
   unsigned long long id;
   bool is_open;
@@ -348,9 +335,6 @@ typedef struct
   PyObject *objects;
   PyObject *types;
 } RegionObject;
-
-static RegionObject *implicit_region = NULL;
-static PyTypeObject *region_type = NULL;
 
 static const char *REGION_ATTRS[] = {
     "name",
@@ -409,7 +393,7 @@ static RegionObject *region_of(PyObject *value)
       PyType_GetDict(isolated_type), "__region__");
   if (region == NULL)
   {
-    return implicit_region;
+    return NULL;
   }
 
   if (region->alias != (PyObject *)region)
@@ -417,7 +401,7 @@ static RegionObject *region_of(PyObject *value)
     region = resolve_region(region);
     if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__region__", (PyObject *)region) < 0)
     {
-      return NULL;
+      PyErr_WarnEx(PyExc_RuntimeWarning, "Unable to set region of object", 1);
     }
   }
 
@@ -499,19 +483,13 @@ static int capture_object(RegionObject *region, PyObject *value)
   PyTypeObject *type = Py_TYPE(value);
   RegionObject *value_region = region_of(value);
 
-  if (value_region == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to obtain region for value");
-    return -1;
-  }
-
   if (is_imm(value) || value_region == region)
   {
     // this value is either immutable, or already captured by the region.
     return 0;
   }
 
-  if (value_region != implicit_region)
+  if (value_region != NULL)
   {
     // this value is captured by another region
     PyErr_SetString(PyExc_RuntimeError,
@@ -519,7 +497,7 @@ static int capture_object(RegionObject *region, PyObject *value)
     return -1;
   }
 
-  if (value->ob_type == region_type)
+  if (value->ob_type == region->ob_base.ob_type)
   {
     // this is a region object, so we need to add it to our graph
     RegionObject *child = (RegionObject *)value;
@@ -1129,7 +1107,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
       .slots = slots,
   };
 
-  PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromModuleAndSpec(veronapymodule, &spec, NULL);
+  PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromSpec(&spec);
   if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__isolated__",
                            (PyObject *)type) < 0)
   {
@@ -1161,7 +1139,7 @@ static PyTypeObject *isolate_type(RegionObject *region, PyTypeObject *type)
 typedef struct
 {
   PyObject_HEAD
-  PyObject *objects;
+      PyObject *objects;
 } MergeObject;
 
 static PyObject *Merge_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -1214,8 +1192,6 @@ static PyTypeObject MergeType = {
     .tp_dealloc = (destructor)Merge_dealloc,
     .tp_getattro = (getattrofunc)Merge_getattro,
 };
-
-static PyTypeObject *merge_type = NULL;
 
 /***************************************************************/
 /*              Region object methods                          */
@@ -1392,7 +1368,7 @@ static PyGetSetDef Region_getsetters[] = {
     {NULL} /* Sentinel */
 };
 
-static bool Region_Check(PyObject *obj) { return Py_TYPE(obj) == region_type; }
+static bool Region_Check(PyObject *obj);
 
 static PyObject *Region_merge(RegionObject *self, PyObject *args,
                               PyObject *kwds)
@@ -1428,7 +1404,7 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 
   PyObject *argList = Py_BuildValue("(O)", other->objects);
 
-  PyObject *merged = PyObject_Call((PyObject *)merge_type, argList, NULL);
+  PyObject *merged = PyObject_Call((PyObject *)&MergeType, argList, NULL);
   if (merged == NULL)
   {
     return NULL;
@@ -1545,12 +1521,6 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
   RegionObject *value_region = region_of(value);
   if (value_region == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to obtain region of value");
-    return -1;
-  }
-
-  if (value_region == implicit_region)
-  {
     rc = capture_object(region, value);
     if (rc < 0)
     {
@@ -1590,12 +1560,22 @@ static PyTypeObject RegionType = {
     .tp_clear = (inquiry)Region_clear,
 };
 
+static bool Region_Check(PyObject *obj)
+{
+  PyTypeObject *obj_type = Py_TYPE(obj);
+  PyTypeObject *region_type = (PyTypeObject *)&RegionType;
+  return obj_type == region_type;
+}
+
 /***************************************************************/
 /*                  Module setup                               */
 /***************************************************************/
 
 PyMODINIT_FUNC PyInit_veronapy(void)
 {
+  PyObject *veronapymodule;
+  PyTypeObject *region_type, *merge_type;
+
   region_type = &RegionType;
   if (PyType_Ready(region_type) < 0)
     return NULL;
@@ -1608,9 +1588,9 @@ PyMODINIT_FUNC PyInit_veronapy(void)
   if (veronapymodule == NULL)
     return NULL;
 
-  PyModule_AddStringConstant(veronapymodule, "__version__", "0.0.1");
+  PyModule_AddStringConstant(veronapymodule, "__version__", "0.0.2");
 
-  Py_INCREF(region_type);
+  Py_INCREF(&RegionType);
   if (PyModule_AddObject(veronapymodule, "region", (PyObject *)region_type) <
       0)
   {
@@ -1626,20 +1606,6 @@ PyMODINIT_FUNC PyInit_veronapy(void)
     Py_DECREF(veronapymodule);
     return NULL;
   }
-
-  PyObject *argList = Py_BuildValue("(s)", "__implicit__");
-
-  implicit_region =
-      (RegionObject *)PyObject_CallObject((PyObject *)region_type, argList);
-  if (implicit_region == NULL)
-  {
-    Py_DECREF(argList);
-    Py_DECREF(region_type);
-    Py_DECREF(veronapymodule);
-    return NULL;
-  }
-
-  Py_DECREF(argList);
 
   return veronapymodule;
 }
