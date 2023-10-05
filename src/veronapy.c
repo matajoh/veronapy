@@ -586,37 +586,171 @@ static int capture_object(RegionObject *region, PyObject *value)
 
 static bool Region_Check(PyObject *obj);
 
-
 /***************************************************************/
 /*                   Behavior Implementation                   */
 /***************************************************************/
 
-typedef struct {
+typedef struct
+{
   atomic_llong count;
   atomic_bool set;
   cnd_t condition;
 } Terminator;
 
-typedef struct {
-  volatile Behavior* next;
+typedef struct
+{
+  volatile Behavior *next;
   volatile bool scheduled;
-  RegionObject* target;
+  RegionObject *target;
 } Request;
 
-typedef struct {
-  PyObject* thunk;
+typedef struct
+{
+  PyObject *thunk;
   atomic_llong count;
   Py_ssize_t length;
-  Request* requests;
+  Request *requests;
 } Behavior;
 
+typedef struct node_s
+{
+  Behavior *behavior;
+  struct node_s *next;
+  struct node_s *prev;
+} Node;
 
-static Terminator* terminator;
+typedef struct
+{
+  Node *front;
+  Node *back;
+  cnd_t available;
+  mtx_t mutex;
+} PCQueue;
 
-Terminator* Terminator_new()
+static PCQueue *work_queue;
+
+static PCQueue *PCQueue_new()
 {
   int rc;
-  Terminator* terminator = (Terminator*)PyMem_Malloc(sizeof(Terminator));
+  PCQueue *queue = (PCQueue *)PyMem_Malloc(sizeof(PCQueue));
+  if (queue == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate queue");
+    return NULL;
+  }
+
+  queue->front = NULL;
+  queue->back = NULL;
+  rc = cnd_init(&queue->available);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize queue condition");
+    return NULL;
+  }
+
+  rc = mtx_init(&queue->mutex, mtx_plain);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize queue mutex");
+    return NULL;
+  }
+
+  return queue;
+}
+
+static void PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
+{
+  Node *node = (Node *)PyMem_Malloc(sizeof(Node));
+  if (node == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate node");
+    return;
+  }
+
+  node->behavior = behavior;
+  node->next = NULL;
+  node->prev = NULL;
+
+  mtx_lock(&queue->mutex);
+  if (queue->front == NULL)
+  {
+    queue->front = node;
+    queue->back = node;
+  }
+  else
+  {
+    queue->back->next = node;
+    node->prev = queue->back;
+    queue->back = node;
+  }
+
+  cnd_signal(&queue->available);
+  mtx_unlock(&queue->mutex);
+}
+
+static Behavior *PCQueue_dequeue(PCQueue *queue)
+{
+  Node *node;
+  Behavior *behavior;
+  mtx_lock(&queue->mutex);
+  while (queue->front == NULL)
+  {
+    cnd_wait(&queue->available, &queue->mutex);
+  }
+
+  node = queue->front;
+  queue->front = node->next;
+  if (queue->front == NULL)
+  {
+    queue->back = NULL;
+  }
+  else
+  {
+    queue->front->prev = NULL;
+  }
+
+  mtx_unlock(&queue->mutex);
+  behavior = node->behavior;
+  PyMem_FREE(node);
+  return behavior;
+}
+
+static void worker(void *arg)
+{
+  // TODO thread setup
+  while (!atomic_load(&terminator->set))
+  {
+    Py_ssize_t i;
+    Request *r;
+    PyObject *result;
+    Behavior *b = PCQueue_dequeue(work_queue);
+    result = PyObject_CallObject(b->thunk, NULL);
+    if (result == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to call behavior");
+      return;
+    }
+
+    Py_DECREF(result);
+    for (i = 0, r = b->requests; i < b->length; ++i, ++r)
+    {
+      Request_release(r);
+    }
+
+    Behavior_free(b);
+    PyMem_FREE(b);
+
+    Terminator_decrement(terminator);
+  }
+  // TODO thread cleanup
+}
+
+static Terminator *terminator;
+
+static Terminator *Terminator_new()
+{
+  int rc;
+  Terminator *terminator = (Terminator *)PyMem_Malloc(sizeof(Terminator));
   if (terminator == NULL)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to allocate terminator");
@@ -634,19 +768,19 @@ Terminator* Terminator_new()
   return terminator;
 }
 
-void Terminator_increment(Terminator* terminator)
+static void Terminator_increment(Terminator *terminator)
 {
   atomic_fetch_add(&terminator->count, 1);
 }
 
-int Terminator_decrement(Terminator* terminator)
+static int Terminator_decrement(Terminator *terminator)
 {
   int rc;
   long long count = atomic_fetch_sub(&terminator->count, 1);
   if (count == 0)
   {
     atomic_store(&terminator->set, true);
-    rc = cnd_broadcast (&terminator->condition); 
+    rc = cnd_broadcast(&terminator->condition);
     if (rc != thrd_success)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to broadcast terminator condition");
@@ -657,7 +791,7 @@ int Terminator_decrement(Terminator* terminator)
   return 0;
 }
 
-int Terminator_wait(Terminator* terminator, mtx_t* mutex)
+static int Terminator_wait(Terminator *terminator, mtx_t *mutex)
 {
   int rc;
   rc = Terminator_decrement(terminator);
@@ -666,7 +800,7 @@ int Terminator_wait(Terminator* terminator, mtx_t* mutex)
     return rc;
   }
 
-  if(atomic_load(&terminator->set))
+  if (atomic_load(&terminator->set))
   {
     return 0;
   }
@@ -681,17 +815,17 @@ int Terminator_wait(Terminator* terminator, mtx_t* mutex)
   return 0;
 }
 
-static void Request_init(Request* self, RegionObject* region);
-static void Request_free(Request* self);
-static void Request_release(Request* self);
-static void Request_start_enqueue(Request* self, Behavior* behavior);
-static void Request_finish_enqueue(Request* self);
+static void Request_init(Request *self, RegionObject *region);
+static void Request_free(Request *self);
+static void Request_release(Request *self);
+static void Request_start_enqueue(Request *self, Behavior *behavior);
+static void Request_finish_enqueue(Request *self);
 
-static Behavior* Behavior_new(PyObject* t, PyObject* regions)
+static Behavior *Behavior_new(PyObject *t, PyObject *regions)
 {
   Py_ssize_t i;
-  Request* r;
-  Behavior* b = (Behavior*)PyMem_Malloc(sizeof(Behavior));
+  Request *r;
+  Behavior *b = (Behavior *)PyMem_Malloc(sizeof(Behavior));
   if (b == NULL)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to allocate behavior");
@@ -703,70 +837,63 @@ static Behavior* Behavior_new(PyObject* t, PyObject* regions)
   PyList_Sort(regions);
   b->length = PyList_Size(regions);
   b->count = b->length + 1;
-  b->requests = (Request*)PyMem_Malloc(sizeof(Request) * b->length);
+  b->requests = (Request *)PyMem_Malloc(sizeof(Request) * b->length);
   if (b->requests == NULL)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to allocate requests");
     return NULL;
   }
 
-  for(i=0, r = b->requests; i < b->length; ++i, ++r){
-    PyObject* region = PyList_GetItem(regions, i);
-    if(region == NULL){
+  for (i = 0, r = b->requests; i < b->length; ++i, ++r)
+  {
+    PyObject *region = PyList_GetItem(regions, i);
+    if (region == NULL)
+    {
       PyErr_SetString(PyExc_RuntimeError, "Unable to get region from list");
       return NULL;
     }
 
-    Request_init(r, (RegionObject*)region);
+    Request_init(r, (RegionObject *)region);
   }
 }
 
-static Behavior* Behavior_free(Behavior* self)
+static Behavior *Behavior_free(Behavior *self)
 {
   Py_ssize_t i;
-  Request* r;
+  Request *r;
   Py_DECREF(self->thunk);
-  for(i=0; r=self->requests, i < self->length; ++i, ++r){
+  for (i = 0; r = self->requests, i < self->length; ++i, ++r)
+  {
     Request_free(r);
   }
 
-  PyMem_Free(self->requests);
+  PyMem_FREE(self->requests);
 }
 
-void Behavior_resolve_one(Behavior* self)
+static void Behavior_resolve_one(Behavior *self)
 {
   Py_ssize_t i;
-  Request* r;
-  PyObject* result;
-  if(atomic_fetch_sub(&self->count, 1) != 0){
-    return;
-  }
-
-  // TODO this needs to run on a thread somehow
-  result = PyObject_CallObject(self->thunk, NULL);
-  if(result == NULL){
-    PyErr_SetString(PyExc_RuntimeError, "Unable to call behavior");
-    return;
-  }
-
-  Py_DECREF(result);
-  for(i=0, r=self->requests; i<self->length; ++i, ++r)
+  Request *r;
+  PyObject *result;
+  if (atomic_fetch_sub(&self->count, 1) != 0)
   {
-    Request_release(r);
+    return;
   }
 
-  Terminator_decrement(terminator);
+  PCQueue_enqueue(work_queue, self);
 }
 
-void Behavior_schedule(Behavior* self)
+static void Behavior_schedule(Behavior *self)
 {
   Py_ssize_t i;
-  Request* r;
-  for(i=0, r=self->requests; i < self->length; ++i, ++r){
+  Request *r;
+  for (i = 0, r = self->requests; i < self->length; ++i, ++r)
+  {
     Request_start_enqueue(r, self);
   }
 
-  for(i=0, r=self->requests; i < self->length; ++i, ++r){
+  for (i = 0, r = self->requests; i < self->length; ++i, ++r)
+  {
     Request_finish_enqueue(r);
   }
 
@@ -775,7 +902,7 @@ void Behavior_schedule(Behavior* self)
   Terminator_increment(terminator);
 }
 
-static void Request_init(Request* self, RegionObject* region)
+static void Request_init(Request *self, RegionObject *region)
 {
   self->next = NULL;
   self->scheduled = false;
@@ -783,20 +910,22 @@ static void Request_init(Request* self, RegionObject* region)
   self->target = region;
 }
 
-static void Request_free(Request* self)
+static void Request_free(Request *self)
 {
   Py_DECREF(self->target);
 }
 
-void Request_release(Request* self)
+static void Request_release(Request *self)
 {
   intptr_t self_ptr = (intptr_t)self;
-  if(self->next == NULL){
-    if(atomic_compare_exchange_strong(&self->target->last, &self_ptr, NULL)){
+  if (self->next == NULL)
+  {
+    if (atomic_compare_exchange_strong(&self->target->last, &self_ptr, NULL))
+    {
       return;
     }
 
-    while(self->next == NULL)
+    while (self->next == NULL)
     {
       thrd_yield();
     }
@@ -805,26 +934,27 @@ void Request_release(Request* self)
   Behavior_resolve_one(self->next);
 }
 
-void Request_start_enqueue(Request* self, Behavior* behavior)
+static void Request_start_enqueue(Request *self, Behavior *behavior)
 {
-  Request* prev;
+  Request *prev;
   intptr_t prev_ptr;
   atomic_compare_exchange_strong(&self->target->last, &prev_ptr, (intptr_t)self);
-  if(prev_ptr == NULL)
+  if (prev_ptr == NULL)
   {
     Behavior_resolve_one(behavior);
     return;
   }
 
-  prev = (Request*)prev_ptr;
+  prev = (Request *)prev_ptr;
   prev->next = behavior;
 
-  while(!prev->scheduled){
+  while (!prev->scheduled)
+  {
     thrd_yield();
   }
 }
 
-void Request_finish_enqueue(Request* self)
+static void Request_finish_enqueue(Request *self)
 {
   self->scheduled = true;
 }
