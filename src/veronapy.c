@@ -1,6 +1,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <threads.h>
+#include <stdbool.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -25,11 +26,9 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
 
 #if PY_VERSION_HEX < 0x030C0000 // Python 3.12
 #define PyType_GetDict(t) ((t)->tp_dict)
+#else
+#define SUBINTERP_GIL
 #endif
-
-typedef long bool;
-#define true 1
-#define false 0
 
 #define _VPY_GETTYPE(n, i, r)                                                  \
   n = (PyTypeObject *)PyDict_GetItemString(PyType_GetDict(i), "__isolated__"); \
@@ -312,20 +311,6 @@ static bool is_imm(PyObject *value)
 }
 
 /***************************************************************/
-/*                     Module variables                        */
-/***************************************************************/
-
-static PyModuleDef veronapymoduledef = {
-    PyModuleDef_HEAD_INIT,
-    .m_name = "veronapy",
-    .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
-             "Concurrency runtime for Python.",
-    .m_size = 0,
-};
-
-atomic_llong region_identity = 0;
-
-/***************************************************************/
 /*              Region struct and functions                    */
 /***************************************************************/
 
@@ -595,7 +580,10 @@ typedef struct
   atomic_llong count;
   atomic_bool set;
   cnd_t condition;
+  mtx_t mutex;
 } Terminator;
+
+typedef struct behavior_s Behavior;
 
 typedef struct
 {
@@ -604,7 +592,7 @@ typedef struct
   RegionObject *target;
 } Request;
 
-typedef struct
+typedef struct behavior_s
 {
   PyObject *thunk;
   atomic_llong count;
@@ -625,9 +613,16 @@ typedef struct
   Node *back;
   cnd_t available;
   mtx_t mutex;
+  bool active;
 } PCQueue;
 
+static atomic_llong region_identity = 0;
+static atomic_bool running = false;
+static Terminator *terminator;
 static PCQueue *work_queue;
+#define NUM_WORKERS 1
+static thrd_t workers[NUM_WORKERS];
+static PyThreadState *subinterpreters[NUM_WORKERS];
 
 static PCQueue *PCQueue_new()
 {
@@ -693,9 +688,15 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
   Node *node;
   Behavior *behavior;
   mtx_lock(&queue->mutex);
-  while (queue->front == NULL)
+  while (queue->front == NULL && queue->active)
   {
     cnd_wait(&queue->available, &queue->mutex);
+  }
+
+  if (!queue->active)
+  {
+    mtx_unlock(&queue->mutex);
+    return NULL;
   }
 
   node = queue->front;
@@ -715,37 +716,42 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
   return behavior;
 }
 
-static void worker(void *arg)
+static int PCQueue_stop(PCQueue *queue)
 {
-  // TODO thread setup
-  while (!atomic_load(&terminator->set))
+  int rc;
+
+  rc = mtx_lock(&queue->mutex);
+  if (rc != thrd_success)
   {
-    Py_ssize_t i;
-    Request *r;
-    PyObject *result;
-    Behavior *b = PCQueue_dequeue(work_queue);
-    result = PyObject_CallObject(b->thunk, NULL);
-    if (result == NULL)
-    {
-      PyErr_SetString(PyExc_RuntimeError, "Unable to call behavior");
-      return;
-    }
-
-    Py_DECREF(result);
-    for (i = 0, r = b->requests; i < b->length; ++i, ++r)
-    {
-      Request_release(r);
-    }
-
-    Behavior_free(b);
-    PyMem_FREE(b);
-
-    Terminator_decrement(terminator);
+    PyErr_SetString(PyExc_RuntimeError, "Unable to lock queue mutex");
+    return -1;
   }
-  // TODO thread cleanup
+
+  queue->active = false;
+
+  rc = mtx_unlock(&queue->mutex);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to unlock queue mutex");
+    return -1;
+  }
+
+  rc = cnd_broadcast(&queue->available);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to broadcast queue condition");
+    return -1;
+  }
+
+  return 0;
 }
 
-static Terminator *terminator;
+static void PCQueue_free(PCQueue *queue)
+{
+  mtx_destroy(&queue->mutex);
+  cnd_destroy(&queue->available);
+  PyMem_FREE(queue);
+}
 
 static Terminator *Terminator_new()
 {
@@ -762,6 +768,13 @@ static Terminator *Terminator_new()
   if (rc != thrd_success)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to initialize terminator condition");
+    return NULL;
+  }
+
+  rc = mtx_init(&terminator->mutex, mtx_plain);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize terminator mutex");
     return NULL;
   }
 
@@ -791,7 +804,7 @@ static int Terminator_decrement(Terminator *terminator)
   return 0;
 }
 
-static int Terminator_wait(Terminator *terminator, mtx_t *mutex)
+static int Terminator_wait(Terminator *terminator)
 {
   int rc;
   rc = Terminator_decrement(terminator);
@@ -805,10 +818,24 @@ static int Terminator_wait(Terminator *terminator, mtx_t *mutex)
     return 0;
   }
 
-  rc = cnd_wait(&terminator->condition, mutex);
+  rc = mtx_lock(&terminator->mutex);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to lock terminator mutex");
+    return -1;
+  }
+
+  rc = cnd_wait(&terminator->condition, &terminator->mutex);
   if (rc != thrd_success)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to wait on terminator condition");
+    return -1;
+  }
+
+  rc = mtx_unlock(&terminator->mutex);
+  if (rc != thrd_success)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to unlock terminator mutex");
     return -1;
   }
 
@@ -857,7 +884,7 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
   }
 }
 
-static Behavior *Behavior_free(Behavior *self)
+static void Behavior_free(Behavior *self)
 {
   Py_ssize_t i;
   Request *r;
@@ -872,9 +899,6 @@ static Behavior *Behavior_free(Behavior *self)
 
 static void Behavior_resolve_one(Behavior *self)
 {
-  Py_ssize_t i;
-  Request *r;
-  PyObject *result;
   if (atomic_fetch_sub(&self->count, 1) != 0)
   {
     return;
@@ -920,7 +944,7 @@ static void Request_release(Request *self)
   intptr_t self_ptr = (intptr_t)self;
   if (self->next == NULL)
   {
-    if (atomic_compare_exchange_strong(&self->target->last, &self_ptr, NULL))
+    if (atomic_compare_exchange_strong(&self->target->last, &self_ptr, (intptr_t)NULL))
     {
       return;
     }
@@ -931,7 +955,7 @@ static void Request_release(Request *self)
     }
   }
 
-  Behavior_resolve_one(self->next);
+  Behavior_resolve_one((Behavior*)self->next);
 }
 
 static void Request_start_enqueue(Request *self, Behavior *behavior)
@@ -939,7 +963,7 @@ static void Request_start_enqueue(Request *self, Behavior *behavior)
   Request *prev;
   intptr_t prev_ptr;
   atomic_compare_exchange_strong(&self->target->last, &prev_ptr, (intptr_t)self);
-  if (prev_ptr == NULL)
+  if (prev_ptr == (intptr_t)NULL)
   {
     Behavior_resolve_one(behavior);
     return;
@@ -958,6 +982,130 @@ static void Request_finish_enqueue(Request *self)
 {
   self->scheduled = true;
 }
+
+static int worker(void *arg)
+{
+  int rc;
+  PyInterpreterState *interp = (PyInterpreterState *)arg;
+  PyThreadState *ts = PyThreadState_New(interp);
+  PyEval_RestoreThread(ts);
+
+  while (!atomic_load(&terminator->set))
+  {
+    Py_ssize_t i;
+    Request *r;
+    PyObject *result;
+    Behavior *b = PCQueue_dequeue(work_queue);
+    if (b == NULL)
+    {
+      // system may be shutting down, so we need to check the terminator again
+      continue;
+    }
+
+    result = PyObject_CallObject(b->thunk, NULL);
+    if (result == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to call behavior");
+      return -1;
+    }
+
+    Py_DECREF(result);
+    for (i = 0, r = b->requests; i < b->length; ++i, ++r)
+    {
+      Request_release(r);
+    }
+
+    Behavior_free(b);
+    PyMem_FREE(b);
+
+    rc = Terminator_decrement(terminator);
+    if (rc != 0)
+    {
+      return rc;
+    }
+  }
+
+  PyThreadState_Clear(ts);
+  PyThreadState_DeleteCurrent();
+
+  return 0;
+}
+
+static int startup_workers()
+{
+  Py_ssize_t i;
+  int rc;
+  bool expected = false;
+
+  if (!atomic_compare_exchange_strong(&running, &expected, true))
+  {
+    return 0;
+  }
+
+  terminator = Terminator_new();
+  work_queue = PCQueue_new();
+  if (work_queue == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate work queue");
+    return -1;
+  }
+
+  PyThreadState *main = PyThreadState_Get();
+  for (i = 0; i < NUM_WORKERS; ++i)
+  {
+    subinterpreters[i] = Py_NewInterpreter();
+    rc = thrd_create(&workers[i], worker, subinterpreters[i]->interp);
+    if (rc != thrd_success)
+    {
+      PyThreadState_Swap(main);
+      PyErr_SetString(PyExc_RuntimeError, "Unable to create worker thread");
+      return -1;
+    }
+  }
+
+  PyThreadState_Swap(main);
+  return 0;
+}
+
+static int shutdown_workers()
+{
+  int rc;
+  bool expected = true;
+
+  if (!atomic_compare_exchange_strong(&running, &expected, false))
+  {
+    return 0;
+  }
+
+  PyThreadState *main = PyThreadState_Get();
+  rc = PCQueue_stop(work_queue);
+  if (rc != 0)
+  {
+    PyThreadState_Swap(main);
+    PyErr_SetString(PyExc_RuntimeError, "Unable to stop work queue");
+    return -1;
+  }
+
+  for (Py_ssize_t i = 0; i < NUM_WORKERS; ++i)
+  {
+    rc = thrd_join(workers[i], NULL);
+    if (rc != thrd_success)
+    {
+      PyThreadState_Swap(main);
+      PyErr_SetString(PyExc_RuntimeError, "Unable to join worker thread");
+      return -1;
+    }
+
+    PyThreadState_Swap(subinterpreters[i]);
+    Py_EndInterpreter(subinterpreters[i]);
+  }
+
+  PCQueue_free(work_queue);
+  PyThreadState_Swap(main);
+
+  return 0;
+}
+
 
 /***************************************************************/
 /*              Isolated object methods                        */
@@ -1951,41 +2099,82 @@ static bool Region_Check(PyObject *obj)
 /*                  Module setup                               */
 /***************************************************************/
 
-PyMODINIT_FUNC PyInit_veronapy(void)
+static int veronapy_exec(PyObject *module)
 {
-  PyObject *veronapymodule;
   PyTypeObject *region_type, *merge_type;
 
   region_type = &RegionType;
   if (PyType_Ready(region_type) < 0)
-    return NULL;
+    return -1;
 
   merge_type = &MergeType;
   if (PyType_Ready(merge_type) < 0)
-    return NULL;
+    return -1;
 
-  veronapymodule = PyModule_Create(&veronapymoduledef);
-  if (veronapymodule == NULL)
-    return NULL;
+  PyModule_AddStringConstant(module, "__version__", "0.0.2");
 
-  PyModule_AddStringConstant(veronapymodule, "__version__", "0.0.2");
-
-  Py_INCREF(&RegionType);
-  if (PyModule_AddObject(veronapymodule, "region", (PyObject *)region_type) <
+  Py_INCREF(region_type);
+  if (PyModule_AddObject(module, "region", (PyObject *)region_type) <
       0)
   {
     Py_DECREF(region_type);
-    Py_DECREF(veronapymodule);
-    return NULL;
+    return -1;
   }
 
   Py_INCREF(merge_type);
-  if (PyModule_AddObject(veronapymodule, "merge", (PyObject *)merge_type) < 0)
+  if (PyModule_AddObject(module, "merge", (PyObject *)merge_type) < 0)
   {
     Py_DECREF(merge_type);
-    Py_DECREF(veronapymodule);
+    return -1;
+  }
+
+  return startup_workers();
+}
+
+#ifdef Py_mod_exec
+static PyModuleDef_Slot veronapy_slots[] = {
+    {Py_mod_exec, (void *)veronapy_exec},
+#if SUBINTERP_GIL
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#endif
+    {0, NULL},
+};
+#endif
+
+static void veronapy_free(PyObject *veronapymodule)
+{
+  Terminator_wait(terminator);
+  shutdown_workers();
+  Py_DECREF(veronapymodule);
+}
+
+static PyModuleDef veronapymoduledef = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "veronapy",
+    .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
+             "Concurrency runtime for Python.",
+    .m_free = (freefunc)veronapy_free,
+#ifdef Py_mod_exec
+    .m_slots = veronapy_slots,
+#endif
+    .m_size = 0};
+
+PyMODINIT_FUNC PyInit_veronapy(void)
+{
+#ifdef Py_mod_exec
+  return PyModuleDef_Init(&veronapymoduledef);
+#else
+  PyObject *module;
+  module = PyModule_Create(&veronapymoduledef);
+  if (module == NULL)
+    return NULL;
+
+  if (veronapy_exec(module) != 0)
+  {
+    Py_DECREF(module);
     return NULL;
   }
 
-  return veronapymodule;
+  return module;
+#endif
 }
