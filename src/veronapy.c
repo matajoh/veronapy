@@ -60,7 +60,7 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
 #define VPY_CHECKREGIONOPEN(r)                                 \
   if (!region->is_open)                                        \
   {                                                            \
-    PyErr_SetString(PyExc_RuntimeError, "Region is not open"); \
+    PyErr_SetString(RegionIsolationError, "Region is not open"); \
     return r;                                                  \
   }
 
@@ -81,7 +81,7 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
   }                                                              \
   else                                                           \
   {                                                              \
-    PyErr_SetString(PyExc_RuntimeError,                          \
+    PyErr_SetString(RegionIsolationError,                          \
                     "First argument belongs to another region"); \
     return r;                                                    \
   }
@@ -103,7 +103,7 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
   }                                                               \
   else                                                            \
   {                                                               \
-    PyErr_SetString(PyExc_RuntimeError,                           \
+    PyErr_SetString(RegionIsolationError,                           \
                     "Second argument belongs to another region"); \
     return r;                                                     \
   }
@@ -314,6 +314,8 @@ static bool is_imm(PyObject *value)
 /*              Region struct and functions                    */
 /***************************************************************/
 
+static PyObject* RegionIsolationError;
+
 typedef struct
 {
   PyObject_HEAD
@@ -484,7 +486,7 @@ static int capture_object(RegionObject *region, PyObject *value)
   if (value_region != NULL)
   {
     // this value is captured by another region
-    PyErr_SetString(PyExc_RuntimeError,
+    PyErr_SetString(RegionIsolationError,
                     "Object already captured by another region");
     return -1;
   }
@@ -501,7 +503,7 @@ static int capture_object(RegionObject *region, PyObject *value)
     }
     else if (!owns(region, child))
     {
-      PyErr_SetString(PyExc_RuntimeError,
+      PyErr_SetString(RegionIsolationError,
                       "Region already attached to a different region graph");
       return -1;
     }
@@ -557,7 +559,7 @@ static int capture_object(RegionObject *region, PyObject *value)
                         (PyObject *)isolated_type);
     if (rc < 0)
     {
-      PyErr_SetString(PyExc_RuntimeError,
+      PyErr_SetString(RegionIsolationError,
                       "Unable to add isolated type to region");
       return -1;
     }
@@ -615,6 +617,12 @@ typedef struct
   mtx_t mutex;
   bool active;
 } PCQueue;
+
+typedef struct
+{
+  PyObject_HEAD
+      PyObject *regions;
+} WhenObject;
 
 static atomic_llong region_identity = 0;
 static atomic_bool running = false;
@@ -861,12 +869,15 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
 
   Py_INCREF(t);
   b->thunk = t;
+  // TODO caller needs to create the list being used here
+  // TODO region needs to sort based upon id
   PyList_Sort(regions);
   b->length = PyList_Size(regions);
   b->count = b->length + 1;
   b->requests = (Request *)PyMem_Malloc(sizeof(Request) * b->length);
   if (b->requests == NULL)
   {
+    PyMem_FREE(b);
     PyErr_SetString(PyExc_RuntimeError, "Unable to allocate requests");
     return NULL;
   }
@@ -876,12 +887,15 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
     PyObject *region = PyList_GetItem(regions, i);
     if (region == NULL)
     {
+      PyMem_FREE(b);
       PyErr_SetString(PyExc_RuntimeError, "Unable to get region from list");
       return NULL;
     }
 
     Request_init(r, (RegionObject *)region);
   }
+
+  return b;
 }
 
 static void Behavior_free(Behavior *self)
@@ -955,15 +969,14 @@ static void Request_release(Request *self)
     }
   }
 
-  Behavior_resolve_one((Behavior*)self->next);
+  Behavior_resolve_one((Behavior *)self->next);
 }
 
 static void Request_start_enqueue(Request *self, Behavior *behavior)
 {
   Request *prev;
-  intptr_t prev_ptr;
-  atomic_compare_exchange_strong(&self->target->last, &prev_ptr, (intptr_t)self);
-  if (prev_ptr == (intptr_t)NULL)
+  intptr_t prev_ptr = (intptr_t)NULL;
+  if (atomic_compare_exchange_strong(&self->target->last, &prev_ptr, (intptr_t)self))
   {
     Behavior_resolve_one(behavior);
     return;
@@ -995,6 +1008,7 @@ static int worker(void *arg)
     Py_ssize_t i;
     Request *r;
     PyObject *result;
+    PyObject *regions;
     Behavior *b = PCQueue_dequeue(work_queue);
     if (b == NULL)
     {
@@ -1002,16 +1016,27 @@ static int worker(void *arg)
       continue;
     }
 
-    result = PyObject_CallObject(b->thunk, NULL);
-    if (result == NULL)
+    regions = PyTuple_New(b->length);
+    if (regions == NULL)
     {
-      PyErr_SetString(PyExc_RuntimeError, "Unable to call behavior");
+      PyErr_SetString(PyExc_RuntimeError, "Unable to allocate regions tuple");
       return -1;
     }
 
-    Py_DECREF(result);
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
+      r->target->is_open = true;
+      Py_INCREF(r->target);
+      PyTuple_SET_ITEM(regions, i, (PyObject *)r->target);
+    }
+
+    result = PyObject_CallObject(b->thunk, regions);
+    Py_DECREF(regions);
+
+    for (i = 0, r = b->requests; i < b->length; ++i, ++r)
+    {
+      r->target->is_open = false;
+      Py_DECREF(r->target);
       Request_release(r);
     }
 
@@ -1023,6 +1048,14 @@ static int worker(void *arg)
     {
       return rc;
     }
+
+    if (result == NULL)
+    {
+      printf("Error in worker thread\n");
+      // TODO log errors somehow
+    }
+
+    Py_DECREF(result);
   }
 
   PyThreadState_Clear(ts);
@@ -1106,6 +1139,101 @@ static int shutdown_workers()
   return 0;
 }
 
+static WhenObject *When_new(PyTypeObject *type, PyObject *args,
+                          PyObject *kwds)
+{
+  WhenObject *self = (WhenObject *)type->tp_alloc(type, 0);
+  if (self == NULL)
+  {
+    return NULL;
+  }
+
+  self->regions = NULL;
+
+  return self;
+}
+
+static int When_init(WhenObject *self, PyObject *args, PyObject *kwds)
+{
+  Py_ssize_t i, num_regions;
+  PyObject *r;
+  num_regions = PyTuple_Size(args);
+  for (i = 0; i < num_regions; ++i)
+  {
+    r = PyTuple_GetItem(args, i);
+    if (r == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to get region from tuple");
+      return -1;
+    }
+
+    if (!Region_Check(r))
+    {
+      PyErr_SetString(PyExc_TypeError, "Expected region");
+      return -1;
+    }
+  }
+
+  Py_INCREF(args);
+  self->regions = args;
+  return 0;
+}
+
+static void When_dealloc(WhenObject *self)
+{
+  Py_XDECREF(self->regions);
+  Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
+{
+  PyObject *thunk;
+  Behavior *b;
+  if (PyTuple_Size(args) != 1)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Expected one argument");
+    return NULL;
+  }
+
+  thunk = PyTuple_GetItem(args, 0);
+  if (thunk == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get thunk from tuple");
+    return NULL;
+  }
+
+  if (!PyCallable_Check(thunk))
+  {
+    PyErr_SetString(PyExc_TypeError, "Expected callable");
+    return NULL;
+  }
+
+  b = Behavior_new(thunk, self->regions);
+  if (b == NULL)
+  {
+    return NULL;
+  }
+
+  Behavior_schedule(b);
+  Py_RETURN_TRUE;
+}
+
+static PyTypeObject WhenType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "veronapy.when_factory",
+    .tp_doc = PyDoc_STR("When factory, returned by when()"),
+    .tp_basicsize = sizeof(WhenObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
+    .tp_new = (newfunc)When_new,
+    .tp_init = (initproc)When_init,
+    .tp_dealloc = (destructor)When_dealloc,
+    .tp_call = (ternaryfunc)When_call,
+};
+
+static PyObject *when(PyObject *args, PyObject *kwargs)
+{
+  return PyObject_CallObject((PyObject*)&WhenType, args);
+}
 
 /***************************************************************/
 /*              Isolated object methods                        */
@@ -1247,7 +1375,7 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
     return obj;
   }
 
-  PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+  PyErr_SetString(RegionIsolationError, "Region is not open");
   return NULL;
 }
 
@@ -1268,7 +1396,7 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
 
   if (!region->is_open)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    PyErr_SetString(RegionIsolationError, "Region is not open");
     return -1;
   }
 
@@ -1918,13 +2046,13 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 
   if (!region->is_open)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    PyErr_SetString(RegionIsolationError, "Region is not open");
     return NULL;
   }
 
   if (!is_free(region))
   {
-    PyErr_SetString(PyExc_RuntimeError, "Region is not free");
+    PyErr_SetString(RegionIsolationError, "Region is not free");
     return NULL;
   }
 
@@ -2013,7 +2141,7 @@ static PyObject *Region_getattro(RegionObject *self, PyObject *attr_name)
 
   if (!region->is_open)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    PyErr_SetString(RegionIsolationError, "Region is not open");
     return NULL;
   }
 
@@ -2042,7 +2170,7 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
 
   if (!region->is_open)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Region is not open");
+    PyErr_SetString(RegionIsolationError, "Region is not open");
     return -1;
   }
 
@@ -2065,7 +2193,7 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
     return rc;
   }
 
-  PyErr_SetString(PyExc_RuntimeError, "Value belongs to another region");
+  PyErr_SetString(RegionIsolationError, "Value belongs to another region");
   return -1;
 }
 
@@ -2099,19 +2227,42 @@ static bool Region_Check(PyObject *obj)
 /*                  Module setup                               */
 /***************************************************************/
 
+static PyMethodDef veronapy_methods[] = {
+    {"when", when, METH_VARARGS, "when decorator"},
+    {NULL} /* Sentinel */
+};
+
 static int veronapy_exec(PyObject *module)
 {
-  PyTypeObject *region_type, *merge_type;
+  PyTypeObject *region_type, *merge_type, *when_type;
 
   region_type = &RegionType;
   if (PyType_Ready(region_type) < 0)
+  {
     return -1;
+  }
 
   merge_type = &MergeType;
   if (PyType_Ready(merge_type) < 0)
+  {
     return -1;
+  }
+
+  when_type = &WhenType;
+  if (PyType_Ready(when_type) < 0)
+  {
+    return -1;
+  }
 
   PyModule_AddStringConstant(module, "__version__", "0.0.2");
+  RegionIsolationError = PyErr_NewException("region.isolation_error", NULL, NULL);
+  Py_XINCREF(RegionIsolationError);
+  if (PyModule_AddObject(module, "isolation_error", RegionIsolationError) < 0)
+  {
+    Py_XDECREF(RegionIsolationError);
+    Py_CLEAR(RegionIsolationError);
+    return -1;
+  }
 
   Py_INCREF(region_type);
   if (PyModule_AddObject(module, "region", (PyObject *)region_type) <
@@ -2125,6 +2276,13 @@ static int veronapy_exec(PyObject *module)
   if (PyModule_AddObject(module, "merge", (PyObject *)merge_type) < 0)
   {
     Py_DECREF(merge_type);
+    return -1;
+  }
+
+  Py_INCREF(when_type);
+  if (PyModule_AddObject(module, "when_factory", (PyObject *)when_type) < 0)
+  {
+    Py_DECREF(when_type);
     return -1;
   }
 
@@ -2154,6 +2312,7 @@ static PyModuleDef veronapymoduledef = {
     .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
              "Concurrency runtime for Python.",
     .m_free = (freefunc)veronapy_free,
+    .m_methods = veronapy_methods,
 #ifdef Py_mod_exec
     .m_slots = veronapy_slots,
 #endif
