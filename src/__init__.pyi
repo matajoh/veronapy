@@ -36,6 +36,13 @@ class region:
             merged into this region.
         """
 
+    def detach_all(self, name: str = None) -> "region":
+        """Detaches all objects from this region.
+
+        The objects are returned as a new private Region, and this region
+        is emptied out.
+        """
+
 
 def when(*regions: region):
     """Returns a decorator that schedules work to be done when the regions are open."""

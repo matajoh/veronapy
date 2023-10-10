@@ -2,6 +2,7 @@
 #include <Python.h>
 #include <threads.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -18,6 +19,11 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
 }
 #else
 #include <stdatomic.h>
+
+atomic_llong atomic_decrement(atomic_llong *ptr)
+{
+  return atomic_fetch_sub(ptr, 1) - 1;
+}
 #endif
 
 /***************************************************************/
@@ -57,11 +63,11 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
   RegionObject *region;  \
   _VPY_GETREGION(region, r)
 
-#define VPY_CHECKREGIONOPEN(r)                                 \
-  if (!region->is_open)                                        \
-  {                                                            \
+#define VPY_CHECKREGIONOPEN(r)                                   \
+  if (!region->is_open)                                          \
+  {                                                              \
     PyErr_SetString(RegionIsolationError, "Region is not open"); \
-    return r;                                                  \
+    return r;                                                    \
   }
 
 #define VPY_CHECKARG0REGION(r)                                   \
@@ -81,7 +87,7 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
   }                                                              \
   else                                                           \
   {                                                              \
-    PyErr_SetString(RegionIsolationError,                          \
+    PyErr_SetString(RegionIsolationError,                        \
                     "First argument belongs to another region"); \
     return r;                                                    \
   }
@@ -103,7 +109,7 @@ atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
   }                                                               \
   else                                                            \
   {                                                               \
-    PyErr_SetString(RegionIsolationError,                           \
+    PyErr_SetString(RegionIsolationError,                         \
                     "Second argument belongs to another region"); \
     return r;                                                     \
   }
@@ -314,7 +320,7 @@ static bool is_imm(PyObject *value)
 /*              Region struct and functions                    */
 /***************************************************************/
 
-static PyObject* RegionIsolationError;
+static PyObject *RegionIsolationError;
 
 typedef struct
 {
@@ -636,49 +642,65 @@ static PCQueue *work_queue;
 static thrd_t workers[NUM_WORKERS];
 static PyThreadState *subinterpreters[NUM_WORKERS];
 
+static const char *threading_error = NULL;
+
+// NB Unless otherwise specified, none of the Behavior-related functions
+// require holding the GIL. Since they are being used from multiple different
+// threads this makes many things easier, especially memory management.
+
 static PCQueue *PCQueue_new()
 {
-  int rc;
-  PCQueue *queue = (PCQueue *)PyMem_Malloc(sizeof(PCQueue));
+  PCQueue *queue;
+
+  printf("PCQueue_new\n");
+
+  queue = (PCQueue *)malloc(sizeof(PCQueue));
   if (queue == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate queue");
+    threading_error = "Unable to allocate queue";
     return NULL;
   }
 
   queue->front = NULL;
   queue->back = NULL;
-  rc = cnd_init(&queue->available);
-  if (rc != thrd_success)
+  if (cnd_init(&queue->available) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize queue condition");
+    threading_error = "Unable to initialize queue condition";
     return NULL;
   }
 
-  rc = mtx_init(&queue->mutex, mtx_plain);
-  if (rc != thrd_success)
+  if (mtx_init(&queue->mutex, mtx_plain) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize queue mutex");
+    threading_error = "Unable to initialize queue mutex";
     return NULL;
   }
 
   return queue;
 }
 
-static void PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
+static int PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
 {
-  Node *node = (Node *)PyMem_Malloc(sizeof(Node));
+  printf("PCQueue_enqueue\n");
+  Node *node = (Node *)malloc(sizeof(Node));
   if (node == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate node");
-    return;
+    threading_error = "Unable to allocate node";
+    return -1;
   }
 
   node->behavior = behavior;
   node->next = NULL;
   node->prev = NULL;
+  printf("Node created\n");
 
-  mtx_lock(&queue->mutex);
+  printf("acquiring queue mutex\n");
+  if (mtx_lock(&queue->mutex) != thrd_success)
+  {
+    threading_error = "Unable to lock queue mutex";
+    return -1;
+  }
+
+  printf("enqueueing node\n");
   if (queue->front == NULL)
   {
     queue->front = node;
@@ -691,23 +713,49 @@ static void PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
     queue->back = node;
   }
 
-  cnd_signal(&queue->available);
-  mtx_unlock(&queue->mutex);
+  printf("signalling workers\n");
+  if (cnd_signal(&queue->available) != thrd_success)
+  {
+    threading_error = "Unable to signal queue condition";
+    return -1;
+  }
+
+  printf("unlocking queue mutex\n");
+  if (mtx_unlock(&queue->mutex) != thrd_success)
+  {
+    threading_error = "Unable to unlock queue mutex";
+    return -1;
+  }
+
+  return 0;
 }
 
 static Behavior *PCQueue_dequeue(PCQueue *queue)
 {
   Node *node;
   Behavior *behavior;
-  mtx_lock(&queue->mutex);
+  if (mtx_lock(&queue->mutex) != thrd_success)
+  {
+    threading_error = "Unable to lock queue mutex";
+    return NULL;
+  }
+
   while (queue->front == NULL && queue->active)
   {
-    cnd_wait(&queue->available, &queue->mutex);
+    if (cnd_wait(&queue->available, &queue->mutex) != thrd_success)
+    {
+      threading_error = "Unable to wait on queue condition";
+      return NULL;
+    }
   }
 
   if (!queue->active)
   {
-    mtx_unlock(&queue->mutex);
+    if (mtx_unlock(&queue->mutex) != thrd_success)
+    {
+      threading_error = "Unable to unlock queue mutex";
+    }
+
     return NULL;
   }
 
@@ -722,36 +770,36 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
     queue->front->prev = NULL;
   }
 
-  mtx_unlock(&queue->mutex);
+  if (mtx_unlock(&queue->mutex) != thrd_success)
+  {
+    threading_error = "Unable to unlock queue mutex";
+    free(node);
+    return NULL;
+  }
+
   behavior = node->behavior;
-  PyMem_FREE(node);
   return behavior;
 }
 
 static int PCQueue_stop(PCQueue *queue)
 {
-  int rc;
-
-  rc = mtx_lock(&queue->mutex);
-  if (rc != thrd_success)
+  if (mtx_lock(&queue->mutex) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to lock queue mutex");
+    threading_error = "Unable to lock queue mutex";
     return -1;
   }
 
   queue->active = false;
 
-  rc = mtx_unlock(&queue->mutex);
-  if (rc != thrd_success)
+  if (mtx_unlock(&queue->mutex) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to unlock queue mutex");
+    threading_error = "Unable to unlock queue mutex";
     return -1;
   }
 
-  rc = cnd_broadcast(&queue->available);
-  if (rc != thrd_success)
+  if (cnd_broadcast(&queue->available) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to broadcast queue condition");
+    threading_error = "Unable to broadcast queue condition";
     return -1;
   }
 
@@ -762,35 +810,44 @@ static void PCQueue_free(PCQueue *queue)
 {
   mtx_destroy(&queue->mutex);
   cnd_destroy(&queue->available);
-  PyMem_FREE(queue);
+  free(queue);
 }
 
 static Terminator *Terminator_new()
 {
-  int rc;
-  Terminator *terminator = (Terminator *)PyMem_Malloc(sizeof(Terminator));
+  Terminator *terminator;
+
+  printf("Terminator_new\n");
+
+  terminator = (Terminator *)malloc(sizeof(Terminator));
   if (terminator == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate terminator");
+    threading_error = "Unable to allocate terminator";
     return NULL;
   }
 
   terminator->count = 1;
-  rc = cnd_init(&terminator->condition);
-  if (rc != thrd_success)
+  terminator->set = false;
+  if (cnd_init(&terminator->condition) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize terminator condition");
+    threading_error = "Unable to initialize terminator condition";
     return NULL;
   }
 
-  rc = mtx_init(&terminator->mutex, mtx_plain);
-  if (rc != thrd_success)
+  if (mtx_init(&terminator->mutex, mtx_plain) != thrd_success)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to initialize terminator mutex");
+    threading_error = "Unable to initialize terminator mutex";
     return NULL;
   }
 
   return terminator;
+}
+
+static void Terminator_free(Terminator *terminator)
+{
+  mtx_destroy(&terminator->mutex);
+  cnd_destroy(&terminator->condition);
+  free(terminator);
 }
 
 static void Terminator_increment(Terminator *terminator)
@@ -800,15 +857,12 @@ static void Terminator_increment(Terminator *terminator)
 
 static int Terminator_decrement(Terminator *terminator)
 {
-  int rc;
-  long long count = atomic_fetch_sub(&terminator->count, 1);
-  if (count == 0)
+  if (atomic_decrement(&terminator->count) == 0)
   {
     atomic_store(&terminator->set, true);
-    rc = cnd_broadcast(&terminator->condition);
-    if (rc != thrd_success)
+    if (cnd_broadcast(&terminator->condition) != thrd_success)
     {
-      PyErr_SetString(PyExc_RuntimeError, "Unable to broadcast terminator condition");
+      threading_error = "Unable to broadcast terminator condition";
       return -1;
     }
   }
@@ -816,12 +870,18 @@ static int Terminator_decrement(Terminator *terminator)
   return 0;
 }
 
+// this function must be called with the GIL held
 static int Terminator_wait(Terminator *terminator)
 {
   int rc;
+  PyThreadState *_save;
+
+  printf("Terminator_wait\n");
+
   rc = Terminator_decrement(terminator);
   if (rc != 0)
   {
+    PyErr_SetString(PyExc_RuntimeError, threading_error);
     return rc;
   }
 
@@ -830,36 +890,49 @@ static int Terminator_wait(Terminator *terminator)
     return 0;
   }
 
-  rc = mtx_lock(&terminator->mutex);
-  if (rc != thrd_success)
+  printf("acquiring terminator mutex\n");
+
+  _save = PyEval_SaveThread();
+  if (mtx_lock(&terminator->mutex) != thrd_success)
   {
+    PyEval_RestoreThread(_save);
     PyErr_SetString(PyExc_RuntimeError, "Unable to lock terminator mutex");
     return -1;
   }
 
-  rc = cnd_wait(&terminator->condition, &terminator->mutex);
-  if (rc != thrd_success)
+  printf("waiting on terminator condition\n");
+
+  if (cnd_wait(&terminator->condition, &terminator->mutex) != thrd_success)
   {
+    PyEval_RestoreThread(_save);
     PyErr_SetString(PyExc_RuntimeError, "Unable to wait on terminator condition");
     return -1;
   }
 
-  rc = mtx_unlock(&terminator->mutex);
-  if (rc != thrd_success)
+  printf("unlocking terminator mutex\n");
+
+  if (mtx_unlock(&terminator->mutex) != thrd_success)
   {
+    PyEval_RestoreThread(_save);
     PyErr_SetString(PyExc_RuntimeError, "Unable to unlock terminator mutex");
     return -1;
   }
+
+  printf("re-acquiring GIL\n");
+
+  PyEval_RestoreThread(_save);
+  printf("All work complete.");
 
   return 0;
 }
 
 static void Request_init(Request *self, RegionObject *region);
 static void Request_free(Request *self);
-static void Request_release(Request *self);
-static void Request_start_enqueue(Request *self, Behavior *behavior);
+static int Request_release(Request *self);
+static int Request_start_enqueue(Request *self, Behavior *behavior);
 static void Request_finish_enqueue(Request *self);
 
+// this must be called while holding the GIL
 static Behavior *Behavior_new(PyObject *t, PyObject *regions)
 {
   Py_ssize_t i;
@@ -901,6 +974,7 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
   return b;
 }
 
+// this must be called while holding the GIL
 static void Behavior_free(Behavior *self)
 {
   Py_ssize_t i;
@@ -912,37 +986,53 @@ static void Behavior_free(Behavior *self)
   }
 
   PyMem_FREE(self->requests);
+  PyMem_FREE(self);
 }
 
-static void Behavior_resolve_one(Behavior *self)
+static int Behavior_resolve_one(Behavior *self)
 {
-  if (atomic_fetch_sub(&self->count, 1) != 0)
+  if (atomic_decrement(&self->count) != 0)
   {
-    return;
+    return 0;
   }
+  
+  printf("enqueueing behavior\n");
 
-  PCQueue_enqueue(work_queue, self);
+  return PCQueue_enqueue(work_queue, self);
 }
 
-static void Behavior_schedule(Behavior *self)
+static int Behavior_schedule(Behavior *self)
 {
+  int rc;
   Py_ssize_t i;
   Request *r;
   for (i = 0, r = self->requests; i < self->length; ++i, ++r)
   {
-    Request_start_enqueue(r, self);
+    printf("start enqueue request %li\n", i);
+    rc = Request_start_enqueue(r, self);
+    if (rc != 0)
+    {
+      return -1;
+    }
   }
 
   for (i = 0, r = self->requests; i < self->length; ++i, ++r)
   {
+    printf("finish enqueue request %li\n", i);
     Request_finish_enqueue(r);
   }
 
-  Behavior_resolve_one(self);
+  rc = Behavior_resolve_one(self);
+  if (rc != 0)
+  {
+    return rc;
+  }
 
   Terminator_increment(terminator);
+  return 0;
 }
 
+// this must be called while holding the GIL
 static void Request_init(Request *self, RegionObject *region)
 {
   self->next = NULL;
@@ -951,38 +1041,42 @@ static void Request_init(Request *self, RegionObject *region)
   self->target = region;
 }
 
+// this must be called while holding the GIL
 static void Request_free(Request *self)
 {
   Py_DECREF(self->target);
 }
 
-static void Request_release(Request *self)
+static int Request_release(Request *self)
 {
   intptr_t self_ptr = (intptr_t)self;
   if (self->next == NULL)
   {
     if (atomic_compare_exchange_strong(&self->target->last, &self_ptr, (intptr_t)NULL))
     {
-      return;
+      printf("No next request\n");
+      return 0;
     }
 
+    printf("Waiting for next request to be set\n");
     while (self->next == NULL)
     {
       thrd_yield();
     }
   }
 
-  Behavior_resolve_one((Behavior *)self->next);
+  printf("Resolving next request\n");
+  return Behavior_resolve_one((Behavior *)self->next);
 }
 
-static void Request_start_enqueue(Request *self, Behavior *behavior)
+static int Request_start_enqueue(Request *self, Behavior *behavior)
 {
   Request *prev;
-  intptr_t prev_ptr = (intptr_t)NULL;
-  if (atomic_compare_exchange_strong(&self->target->last, &prev_ptr, (intptr_t)self))
+  intptr_t prev_ptr = atomic_exchange(&self->target->last, (intptr_t)self);
+  if (prev_ptr == (intptr_t)NULL)
   {
-    Behavior_resolve_one(behavior);
-    return;
+    printf("No previous request\n");
+    return Behavior_resolve_one(behavior);
   }
 
   prev = (Request *)prev_ptr;
@@ -992,6 +1086,8 @@ static void Request_start_enqueue(Request *self, Behavior *behavior)
   {
     thrd_yield();
   }
+
+  return 0;
 }
 
 static void Request_finish_enqueue(Request *self)
@@ -999,12 +1095,22 @@ static void Request_finish_enqueue(Request *self)
   self->scheduled = true;
 }
 
+// TODO need two versions of this
+// one which works in a global GIL context, and another
+// which works in a per-subinterp gil context
 static int worker(void *arg)
 {
   int rc;
-  PyInterpreterState *interp = (PyInterpreterState *)arg;
-  PyThreadState *ts = PyThreadState_New(interp);
-  PyEval_RestoreThread(ts);
+  PyInterpreterState *interp;
+  PyThreadState *ts;
+
+  printf("worker starting\n");
+
+  interp = (PyInterpreterState *)arg;
+  printf("before thread state %p\n", interp);
+  ts = PyThreadState_New(interp);
+  printf("thread created %p %p\n", interp, ts);
+  PyEval_AcquireThread(ts);
 
   while (!atomic_load(&terminator->set))
   {
@@ -1012,17 +1118,36 @@ static int worker(void *arg)
     Request *r;
     PyObject *result;
     PyObject *regions;
-    Behavior *b = PCQueue_dequeue(work_queue);
+    Behavior *b;
+
+    ts = PyEval_SaveThread();
+    printf("waiting for work...\n");
+    b = PCQueue_dequeue(work_queue);
     if (b == NULL)
     {
+      printf("received NULL behavior\n");
+      if (threading_error != NULL)
+      {
+        PyEval_RestoreThread(ts);
+        PyErr_SetString(PyExc_RuntimeError, threading_error);
+        PyThreadState_Clear(ts);
+        PyThreadState_DeleteCurrent();
+        return -1;
+      }
+
       // system may be shutting down, so we need to check the terminator again
       continue;
     }
 
+    printf("received work\n");
+    PyEval_RestoreThread(ts);
+    printf("preparing regions...\n");
     regions = PyTuple_New(b->length);
     if (regions == NULL)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to allocate regions tuple");
+      PyThreadState_Clear(ts);
+      PyThreadState_DeleteCurrent();
       return -1;
     }
 
@@ -1033,22 +1158,38 @@ static int worker(void *arg)
       PyTuple_SET_ITEM(regions, i, (PyObject *)r->target);
     }
 
+    printf("Calling thunk...\n");
     result = PyObject_CallObject(b->thunk, regions);
     Py_DECREF(regions);
 
+    printf("releasing requests\n");
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
       r->target->is_open = false;
       Py_DECREF(r->target);
-      Request_release(r);
+      ts = PyEval_SaveThread();
+      rc = Request_release(r);
+      PyEval_RestoreThread(ts);
+      if (rc != 0)
+      {
+        PyErr_SetString(PyExc_RuntimeError, threading_error);
+        PyThreadState_Clear(ts);
+        PyThreadState_DeleteCurrent();
+        return rc;
+      }
     }
 
+    printf("freeing behavior\n");
     Behavior_free(b);
-    PyMem_FREE(b);
 
+    printf("Decrementing terminator...\n");
     rc = Terminator_decrement(terminator);
+
     if (rc != 0)
     {
+      PyErr_SetString(PyExc_RuntimeError, threading_error);
+      PyThreadState_Clear(ts);
+      PyThreadState_DeleteCurrent();
       return rc;
     }
 
@@ -1057,18 +1198,21 @@ static int worker(void *arg)
       printf("Error in worker thread\n");
       // TODO log errors somehow
     }
-
-    Py_DECREF(result);
   }
 
+  printf("destroying thread and releasing the GIL\n");
   PyThreadState_Clear(ts);
   PyThreadState_DeleteCurrent();
+
+  printf("worker exiting\n");
 
   return 0;
 }
 
 static int startup_workers()
 {
+  PyInterpreterState *interp;
+  PyThreadState *ts;
   Py_ssize_t i;
   int rc;
   bool expected = false;
@@ -1084,68 +1228,90 @@ static int startup_workers()
   work_queue = PCQueue_new();
   if (work_queue == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate work queue");
+    PyErr_SetString(PyExc_RuntimeError, threading_error);
     return -1;
   }
 
-  PyThreadState *main = PyThreadState_Get();
+  printf("creating subinterpreters\n");
+
+  ts = PyThreadState_Get();
+  interp = PyThreadState_GetInterpreter(ts);
+  printf("thread id %lu interp id %li\n", PyThreadState_GetID(ts), PyInterpreterState_GetID(interp));
   for (i = 0; i < NUM_WORKERS; ++i)
   {
+    printf("subinterpreter %li\n", i);
     subinterpreters[i] = Py_NewInterpreter();
+  }
+
+  PyThreadState_Swap(ts);
+
+  printf("starting workers\n");
+  for (i = 0; i < NUM_WORKERS; ++i)
+  {
     rc = thrd_create(&workers[i], worker, subinterpreters[i]->interp);
     if (rc != thrd_success)
     {
-      PyThreadState_Swap(main);
       PyErr_SetString(PyExc_RuntimeError, "Unable to create worker thread");
       return -1;
     }
   }
 
-  PyThreadState_Swap(main);
   return 0;
 }
 
 static int shutdown_workers()
 {
   int rc;
+  PyThreadState* _save;
   bool expected = true;
 
+  printf("shutting down workers\n");
   if (!atomic_compare_exchange_strong(&running, &expected, false))
   {
     return 0;
   }
 
-  PyThreadState *main = PyThreadState_Get();
+  printf("stopping work queue\n");
+  Py_BEGIN_ALLOW_THREADS
   rc = PCQueue_stop(work_queue);
+  Py_END_ALLOW_THREADS
   if (rc != 0)
   {
-    PyThreadState_Swap(main);
     PyErr_SetString(PyExc_RuntimeError, "Unable to stop work queue");
     return -1;
   }
 
+  printf("waiting for workers\n");
+  _save = PyThreadState_Get();
   for (Py_ssize_t i = 0; i < NUM_WORKERS; ++i)
   {
+    printf("joining worker thread %li\n", i);
+    Py_BEGIN_ALLOW_THREADS
     rc = thrd_join(workers[i], NULL);
+    Py_END_ALLOW_THREADS
     if (rc != thrd_success)
     {
-      PyThreadState_Swap(main);
       PyErr_SetString(PyExc_RuntimeError, "Unable to join worker thread");
       return -1;
     }
 
+    printf("ending subinterpreter %li\n", i);
     PyThreadState_Swap(subinterpreters[i]);
     Py_EndInterpreter(subinterpreters[i]);
   }
 
+  PyThreadState_Swap(_save);
+
+  printf("freeing work queue\n");
   PCQueue_free(work_queue);
-  PyThreadState_Swap(main);
+
+  printf("threading system shutdown complete\n");
 
   return 0;
 }
 
 static WhenObject *When_new(PyTypeObject *type, PyObject *args,
-                          PyObject *kwds)
+                            PyObject *kwds)
 {
   WhenObject *self = (WhenObject *)type->tp_alloc(type, 0);
   if (self == NULL)
@@ -1177,6 +1343,12 @@ static int When_init(WhenObject *self, PyObject *args, PyObject *kwds)
       PyErr_SetString(PyExc_TypeError, "Expected region");
       return -1;
     }
+
+    if (!((RegionObject *)r)->is_shared)
+    {
+      PyErr_SetString(RegionIsolationError, "Region must be shared");
+      return -1;
+    }
   }
 
   Py_INCREF(args);
@@ -1195,6 +1367,9 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
   PyObject *thunk;
   Behavior *b;
   PyObject *regions;
+  int rc;
+
+  printf("When_call\n");
   if (PyTuple_Size(args) != 1)
   {
     PyErr_SetString(PyExc_RuntimeError, "Expected one argument");
@@ -1221,6 +1396,7 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
+  printf("creating behavior\n");
   b = Behavior_new(thunk, regions);
   Py_DECREF(regions);
 
@@ -1229,7 +1405,17 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
-  Behavior_schedule(b);
+  printf("scheduling behavior\n");
+  Py_BEGIN_ALLOW_THREADS
+  rc = Behavior_schedule(b);
+  Py_END_ALLOW_THREADS
+
+  if(rc != 0)
+  {
+    PyErr_SetString(PyExc_RuntimeError, threading_error);
+    return NULL;
+  }
+
   Py_RETURN_TRUE;
 }
 
@@ -1245,9 +1431,11 @@ static PyTypeObject WhenType = {
     .tp_call = (ternaryfunc)When_call,
 };
 
-static PyObject *when(PyObject *args, PyObject *kwargs)
+static PyObject *when(PyObject *module, PyObject *args)
 {
-  return PyObject_CallObject((PyObject*)&WhenType, args);
+  PyObject *when_factory;
+  when_factory = PyObject_CallObject((PyObject *)&WhenType, args);
+  return when_factory;
 }
 
 /***************************************************************/
@@ -2086,14 +2274,73 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
   return merged;
 }
 
-static PyObject* Region_makeshareable(RegionObject* self)
+static PyObject *Region_makeshareable(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
   VPY_REGION(self);
-  
+
   region->is_shared = true;
   region->last = 0;
   Py_INCREF(self);
-  return (PyObject*)self;
+  return (PyObject *)self;
+}
+
+static PyObject *Region_detachall(RegionObject *self, PyObject *args)
+{
+  Py_ssize_t i, len;
+  PyObject *objects, *types, *type_values;
+  RegionObject *detached;
+  VPY_REGION(self);
+
+  if (!region->is_open)
+  {
+    PyErr_SetString(RegionIsolationError, "Region must be open");
+    return NULL;
+  }
+
+  if (!region->is_shared)
+  {
+    PyErr_SetString(RegionIsolationError, "Region must be shared");
+    return NULL;
+  }
+
+  detached = (RegionObject *)PyObject_CallObject((PyObject *)self->ob_base.ob_type, args);
+  if (detached == NULL)
+  {
+    return NULL;
+  }
+
+  objects = self->objects;
+  types = self->types;
+  self->objects = detached->objects;
+  self->types = detached->types;
+  detached->objects = objects;
+  detached->types = types;
+
+  type_values = PyDict_Values(types);
+  if (type_values == NULL)
+  {
+    return NULL;
+  }
+
+  len = PyList_Size(type_values);
+  for (i = 0; i < len; i++)
+  {
+    PyTypeObject *isolated_type = (PyTypeObject *)PyList_GetItem(type_values, i);
+    if (isolated_type == NULL)
+    {
+      return NULL;
+    }
+
+    Py_INCREF(detached);
+    if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__region__", (PyObject *)detached) < 0)
+    {
+      Py_DECREF(detached);
+      return NULL;
+    }
+  }
+
+  Py_INCREF(detached);
+  return (PyObject *)detached;
 }
 
 static PyObject *Region_str(RegionObject *self, PyObject *Py_UNUSED(ignored))
@@ -2152,6 +2399,8 @@ static PyMethodDef Region_methods[] = {
      "Merge the other region into this one"},
     {"make_shareable", (PyCFunction)Region_makeshareable, METH_NOARGS,
      "Make the region shareable"},
+    {"detach_all", (PyCFunction)Region_detachall, METH_VARARGS,
+     "Detach all objects from the region"},
     {NULL} /* Sentinel */
 };
 
@@ -2230,21 +2479,21 @@ static Py_hash_t Region_hash(RegionObject *self)
   return (Py_hash_t)region->id;
 }
 
-static PyObject* Region_richcompare(PyObject* lhs, PyObject* rhs, int op)
+static PyObject *Region_richcompare(PyObject *lhs, PyObject *rhs, int op)
 {
-  RegionObject* lhs_region, *rhs_region;
+  RegionObject *lhs_region, *rhs_region;
   if (!Region_Check(rhs))
   {
     Py_RETURN_NOTIMPLEMENTED;
   }
 
-  lhs_region = (RegionObject*)lhs;
-  rhs_region = (RegionObject*)rhs;
+  lhs_region = (RegionObject *)lhs;
+  rhs_region = (RegionObject *)rhs;
   if (lhs_region->alias != lhs)
-  {                                    
+  {
     lhs_region = resolve_region(lhs_region);
   }
-  if(rhs_region->alias != rhs)
+  if (rhs_region->alias != rhs)
   {
     rhs_region = resolve_region(rhs_region);
   }
@@ -2284,8 +2533,31 @@ static bool Region_Check(PyObject *obj)
 /*                  Module setup                               */
 /***************************************************************/
 
+static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
+{
+  printf("wait\n");
+  printf("Waiting for terminator to be set\n");
+  if (Terminator_wait(terminator) < 0)
+  {
+    return NULL;
+  }
+
+  printf("Shutting down workers\n");
+  if (shutdown_workers() < 0)
+  {
+    return NULL;
+  }
+
+  Terminator_free(terminator);
+
+  printf("done waiting\n");
+
+  Py_RETURN_TRUE;
+}
+
 static PyMethodDef veronapy_methods[] = {
     {"when", when, METH_VARARGS, "when decorator"},
+    {"wait", (PyCFunction)veronapy_wait, METH_NOARGS, "wait for all regions to complete"},
     {NULL} /* Sentinel */
 };
 
@@ -2349,26 +2621,18 @@ static int veronapy_exec(PyObject *module)
 #ifdef Py_mod_exec
 static PyModuleDef_Slot veronapy_slots[] = {
     {Py_mod_exec, (void *)veronapy_exec},
-#if SUBINTERP_GIL
+#ifdef SUBINTERP_GIL
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
 #endif
     {0, NULL},
 };
 #endif
 
-static void veronapy_free(PyObject *veronapymodule)
-{
-  Terminator_wait(terminator);
-  shutdown_workers();
-  Py_DECREF(veronapymodule);
-}
-
 static PyModuleDef veronapymoduledef = {
     PyModuleDef_HEAD_INIT,
     .m_name = "veronapy",
     .m_doc = "veronapy is a Python extension that adds Behavior-oriented "
              "Concurrency runtime for Python.",
-    .m_free = (freefunc)veronapy_free,
     .m_methods = veronapy_methods,
 #ifdef Py_mod_exec
     .m_slots = veronapy_slots,
