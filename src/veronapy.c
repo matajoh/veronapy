@@ -337,8 +337,12 @@ static const char *REGION_ATTRS[] = {
     "is_open",
     "merge",
     "is_shared",
+    "make_shareable",
     "__enter__",
     "__exit__",
+    "__lt__",
+    "__eq__",
+    "__hash__",
     NULL,
 };
 
@@ -1073,6 +1077,8 @@ static int startup_workers()
   {
     return 0;
   }
+
+  // TODO use os.sched_getaffinity(0) to get the number of cores
 
   terminator = Terminator_new();
   work_queue = PCQueue_new();
@@ -2306,9 +2312,9 @@ static int veronapy_exec(PyObject *module)
   }
 
   PyModule_AddStringConstant(module, "__version__", "0.0.2");
-  RegionIsolationError = PyErr_NewException("region.isolation_error", NULL, NULL);
+  RegionIsolationError = PyErr_NewException("veronapy.RegionIsolationError", NULL, NULL);
   Py_XINCREF(RegionIsolationError);
-  if (PyModule_AddObject(module, "isolation_error", RegionIsolationError) < 0)
+  if (PyModule_AddObject(module, "RegionIsolationError", RegionIsolationError) < 0)
   {
     Py_XDECREF(RegionIsolationError);
     Py_CLEAR(RegionIsolationError);

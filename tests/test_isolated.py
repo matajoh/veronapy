@@ -2,7 +2,7 @@
 
 from typing import Callable
 
-from veronapy import region
+from veronapy import region, RegionIsolationError
 
 
 def test_container():
@@ -72,7 +72,7 @@ def test_maths():
 
     try:
         print(x + a)
-    except RuntimeError:
+    except RegionIsolationError:
         pass
     else:
         raise AssertionError
