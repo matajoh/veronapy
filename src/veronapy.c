@@ -869,8 +869,7 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
 
   Py_INCREF(t);
   b->thunk = t;
-  // TODO caller needs to create the list being used here
-  // TODO region needs to sort based upon id
+
   PyList_Sort(regions);
   b->length = PyList_Size(regions);
   b->count = b->length + 1;
@@ -1189,6 +1188,7 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
 {
   PyObject *thunk;
   Behavior *b;
+  PyObject *regions;
   if (PyTuple_Size(args) != 1)
   {
     PyErr_SetString(PyExc_RuntimeError, "Expected one argument");
@@ -1208,7 +1208,16 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
-  b = Behavior_new(thunk, self->regions);
+  regions = PySequence_List(self->regions);
+  if (regions == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to convert regions to list");
+    return NULL;
+  }
+
+  b = Behavior_new(thunk, regions);
+  Py_DECREF(regions);
+
   if (b == NULL)
   {
     return NULL;
@@ -2071,6 +2080,16 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
   return merged;
 }
 
+static PyObject* Region_makeshareable(RegionObject* self)
+{
+  VPY_REGION(self);
+  
+  region->is_shared = true;
+  region->last = 0;
+  Py_INCREF(self);
+  return (PyObject*)self;
+}
+
 static PyObject *Region_str(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
   VPY_REGION(self);
@@ -2125,6 +2144,8 @@ static PyMethodDef Region_methods[] = {
      "exception that occurred should be suppressed."},
     {"merge", (PyCFunction)Region_merge, METH_VARARGS,
      "Merge the other region into this one"},
+    {"make_shareable", (PyCFunction)Region_makeshareable, METH_NOARGS,
+     "Make the region shareable"},
     {NULL} /* Sentinel */
 };
 
@@ -2197,6 +2218,34 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
   return -1;
 }
 
+static Py_hash_t Region_hash(RegionObject *self)
+{
+  VPY_REGION(self);
+  return (Py_hash_t)region->id;
+}
+
+static PyObject* Region_richcompare(PyObject* lhs, PyObject* rhs, int op)
+{
+  RegionObject* lhs_region, *rhs_region;
+  if (!Region_Check(rhs))
+  {
+    Py_RETURN_NOTIMPLEMENTED;
+  }
+
+  lhs_region = (RegionObject*)lhs;
+  rhs_region = (RegionObject*)rhs;
+  if (lhs_region->alias != lhs)
+  {                                    
+    lhs_region = resolve_region(lhs_region);
+  }
+  if(rhs_region->alias != rhs)
+  {
+    rhs_region = resolve_region(rhs_region);
+  }
+
+  Py_RETURN_RICHCOMPARE(lhs_region->id, rhs_region->id, op);
+}
+
 static PyTypeObject RegionType = {
     PyVarObject_HEAD_INIT(NULL, 0).tp_name = "veronapy.region",
     .tp_doc = PyDoc_STR("Region object"),
@@ -2214,6 +2263,8 @@ static PyTypeObject RegionType = {
     .tp_getattro = (getattrofunc)Region_getattro,
     .tp_traverse = (traverseproc)Region_traverse,
     .tp_clear = (inquiry)Region_clear,
+    .tp_hash = (hashfunc)Region_hash,
+    .tp_richcompare = (richcmpfunc)Region_richcompare,
 };
 
 static bool Region_Check(PyObject *obj)
