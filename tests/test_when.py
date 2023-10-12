@@ -1,5 +1,5 @@
 import json
-from veronapy import region, RegionIsolationError, when
+from veronapy import region, RegionIsolationError, wait, when, run
 
 
 class MockObject:
@@ -15,6 +15,7 @@ def test_shareable():
 
 
 def test_when():
+    run()
     my_account = region()
     your_account = region()
 
@@ -36,8 +37,11 @@ def test_when():
         assert m.balance == 0
         assert y.balance == 100
 
+    wait()
+
 
 def test_detach():
+    run()
     c1 = region("c1")
     c2 = region("c2")
 
@@ -50,7 +54,7 @@ def test_detach():
 
     # when c1, c2:
     @when(c1, c2)
-    def _():
+    def _(c1, c2):
         r1, r2 = c1.detach_all("r1"), c2.detach_all("r2")
         merge = c1.merge(r2)
         c1.b = merge.b
@@ -59,12 +63,15 @@ def test_detach():
 
     # when c1, c2:
     @when(c1, c2)
-    def _():
+    def _(c1, c2):
         assert c1.b == "bar"
         assert c2.a == "foo"
 
+    wait()
+
 
 def test_when_private():
+    run()
     r1 = region("Bank1")
     r2 = region("Bank2")
 
@@ -78,3 +85,5 @@ def test_when_private():
         pass
     else:
         raise AssertionError
+
+    wait()

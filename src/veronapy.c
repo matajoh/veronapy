@@ -266,6 +266,8 @@ atomic_llong atomic_decrement(atomic_llong *ptr)
     region = resolve_region(region);    \
   }
 
+#define VPY_ERROR(x) fprintf(stderr, "veronapy Error: %s\n", x);
+
 /***************************************************************/
 /*                     Useful functions                        */
 /***************************************************************/
@@ -321,6 +323,7 @@ static bool is_imm(PyObject *value)
 /***************************************************************/
 
 static PyObject *RegionIsolationError;
+static PyObject *WhenError;
 
 typedef struct
 {
@@ -344,6 +347,7 @@ static const char *REGION_ATTRS[] = {
     "merge",
     "is_shared",
     "make_shareable",
+    "detach_all",
     "__enter__",
     "__exit__",
     "__lt__",
@@ -634,19 +638,137 @@ typedef struct
       PyObject *regions;
 } WhenObject;
 
+typedef struct behavior_exception_s
+{
+  PyInterpreterState *interp;
+  char *name;
+  char *msg;
+  struct behavior_exception_s *next;
+} BehaviorException;
+
+static atomic_intptr_t behavior_exceptions = (intptr_t)NULL;
 static atomic_llong region_identity = 0;
 static atomic_bool running = false;
 static Terminator *terminator;
 static PCQueue *work_queue;
-#define NUM_WORKERS 1
-static thrd_t workers[NUM_WORKERS];
-static PyThreadState *subinterpreters[NUM_WORKERS];
-
-static const char *threading_error = NULL;
+static Py_ssize_t worker_count = 1;
+static thrd_t *workers;
+static PyThreadState **subinterpreters;
 
 // NB Unless otherwise specified, none of the Behavior-related functions
 // require holding the GIL. Since they are being used from multiple different
 // threads this makes many things easier, especially memory management.
+
+static void BehaviorException_new(PyObject *type, PyObject *value, PyObject *traceback)
+{
+  BehaviorException *ex;
+  intptr_t next;
+  const char *str;
+
+  printf("BehaviorException_new %p %p %p\n", type, value, traceback);
+  ex = (BehaviorException *)malloc(sizeof(BehaviorException));
+  if (ex == NULL)
+  {
+    printf("Unable to allocate behavior exception\n");
+    goto unraisable;
+  }
+
+  if (traceback != NULL)
+  {
+    if (PyException_SetTraceback(value, traceback) < 0)
+    {
+      printf("Unable to set traceback\n");
+      goto unraisable;
+    }
+  }
+
+  PyObject *nameobj = PyUnicode_FromString(((PyTypeObject *)type)->tp_name);
+  if (nameobj == NULL)
+  {
+    printf("Unable to get type name\n");
+    goto unraisable;
+  }
+
+  str = PyUnicode_AsUTF8(nameobj);
+  if (str == NULL)
+  {
+    printf("Unable to get type name\n");
+    goto unraisable;
+  }
+
+  ex->name = malloc(strlen(str) + 1);
+  if (ex->name == NULL)
+  {
+    printf("Unable to allocate type name\n");
+    goto unraisable;
+  }
+
+  strcpy(ex->name, str);
+
+  Py_DECREF(nameobj);
+
+  if (value != NULL)
+  {
+    PyObject *msgobj = PyUnicode_FromFormat("%S", value);
+    if (msgobj == NULL)
+    {
+      printf("Unable to get exception message\n");
+      goto unraisable;
+    }
+
+    str = PyUnicode_AsUTF8(msgobj);
+    if (str == NULL)
+    {
+      printf("Unable to get exception message\n");
+      goto unraisable;
+    }
+
+    ex->msg = malloc(strlen(str) + 1);
+    if (ex->msg == NULL)
+    {
+      printf("Unable to allocate exception message\n");
+      goto unraisable;
+    }
+
+    strcpy(ex->msg, str);
+
+    Py_DECREF(msgobj);
+  }
+  else
+  {
+    ex->msg = NULL;
+  }
+
+  ex->interp = PyInterpreterState_Get();
+
+  next = atomic_exchange(&behavior_exceptions, (intptr_t)ex);
+  ex->next = (BehaviorException *)next;
+  goto end;
+
+unraisable:
+  PyErr_WriteUnraisable(value);
+
+end:
+  Py_XDECREF(type);
+  Py_XDECREF(value);
+  Py_XDECREF(traceback);
+  return;
+}
+
+static void BehaviorException_free(BehaviorException *ex)
+{
+  if (ex->name != NULL)
+  {
+    free(ex->name);
+  }
+
+  if (ex->msg != NULL)
+  {
+    free(ex->msg);
+  }
+
+  free(ex);
+}
 
 static PCQueue *PCQueue_new()
 {
@@ -657,7 +779,7 @@ static PCQueue *PCQueue_new()
   queue = (PCQueue *)malloc(sizeof(PCQueue));
   if (queue == NULL)
   {
-    threading_error = "Unable to allocate queue";
+    VPY_ERROR("Unable to allocate queue");
     return NULL;
   }
 
@@ -665,13 +787,13 @@ static PCQueue *PCQueue_new()
   queue->back = NULL;
   if (cnd_init(&queue->available) != thrd_success)
   {
-    threading_error = "Unable to initialize queue condition";
+    VPY_ERROR("Unable to initialize queue condition");
     return NULL;
   }
 
   if (mtx_init(&queue->mutex, mtx_plain) != thrd_success)
   {
-    threading_error = "Unable to initialize queue mutex";
+    VPY_ERROR("Unable to initialize queue mutex");
     return NULL;
   }
 
@@ -684,7 +806,7 @@ static int PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
   Node *node = (Node *)malloc(sizeof(Node));
   if (node == NULL)
   {
-    threading_error = "Unable to allocate node";
+    VPY_ERROR("Unable to allocate node");
     return -1;
   }
 
@@ -696,7 +818,7 @@ static int PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
   printf("acquiring queue mutex\n");
   if (mtx_lock(&queue->mutex) != thrd_success)
   {
-    threading_error = "Unable to lock queue mutex";
+    VPY_ERROR("Unable to lock queue mutex");
     return -1;
   }
 
@@ -716,14 +838,14 @@ static int PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
   printf("signalling workers\n");
   if (cnd_signal(&queue->available) != thrd_success)
   {
-    threading_error = "Unable to signal queue condition";
+    VPY_ERROR("Unable to signal queue condition");
     return -1;
   }
 
   printf("unlocking queue mutex\n");
   if (mtx_unlock(&queue->mutex) != thrd_success)
   {
-    threading_error = "Unable to unlock queue mutex";
+    VPY_ERROR("Unable to unlock queue mutex");
     return -1;
   }
 
@@ -736,7 +858,7 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
   Behavior *behavior;
   if (mtx_lock(&queue->mutex) != thrd_success)
   {
-    threading_error = "Unable to lock queue mutex";
+    VPY_ERROR("Unable to lock queue mutex");
     return NULL;
   }
 
@@ -744,7 +866,7 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
   {
     if (cnd_wait(&queue->available, &queue->mutex) != thrd_success)
     {
-      threading_error = "Unable to wait on queue condition";
+      VPY_ERROR("Unable to wait on queue condition");
       return NULL;
     }
   }
@@ -753,7 +875,7 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
   {
     if (mtx_unlock(&queue->mutex) != thrd_success)
     {
-      threading_error = "Unable to unlock queue mutex";
+      VPY_ERROR("Unable to unlock queue mutex");
     }
 
     return NULL;
@@ -772,7 +894,7 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
 
   if (mtx_unlock(&queue->mutex) != thrd_success)
   {
-    threading_error = "Unable to unlock queue mutex";
+    VPY_ERROR("Unable to unlock queue mutex");
     free(node);
     return NULL;
   }
@@ -785,7 +907,7 @@ static int PCQueue_stop(PCQueue *queue)
 {
   if (mtx_lock(&queue->mutex) != thrd_success)
   {
-    threading_error = "Unable to lock queue mutex";
+    VPY_ERROR("Unable to lock queue mutex");
     return -1;
   }
 
@@ -793,13 +915,13 @@ static int PCQueue_stop(PCQueue *queue)
 
   if (mtx_unlock(&queue->mutex) != thrd_success)
   {
-    threading_error = "Unable to unlock queue mutex";
+    VPY_ERROR("Unable to unlock queue mutex");
     return -1;
   }
 
   if (cnd_broadcast(&queue->available) != thrd_success)
   {
-    threading_error = "Unable to broadcast queue condition";
+    VPY_ERROR("Unable to broadcast queue condition");
     return -1;
   }
 
@@ -822,7 +944,7 @@ static Terminator *Terminator_new()
   terminator = (Terminator *)malloc(sizeof(Terminator));
   if (terminator == NULL)
   {
-    threading_error = "Unable to allocate terminator";
+    VPY_ERROR("Unable to allocate terminator");
     return NULL;
   }
 
@@ -830,13 +952,13 @@ static Terminator *Terminator_new()
   terminator->set = false;
   if (cnd_init(&terminator->condition) != thrd_success)
   {
-    threading_error = "Unable to initialize terminator condition";
+    VPY_ERROR("Unable to initialize terminator condition");
     return NULL;
   }
 
   if (mtx_init(&terminator->mutex, mtx_plain) != thrd_success)
   {
-    threading_error = "Unable to initialize terminator mutex";
+    VPY_ERROR("Unable to initialize terminator mutex");
     return NULL;
   }
 
@@ -862,7 +984,7 @@ static int Terminator_decrement(Terminator *terminator)
     atomic_store(&terminator->set, true);
     if (cnd_broadcast(&terminator->condition) != thrd_success)
     {
-      threading_error = "Unable to broadcast terminator condition";
+      VPY_ERROR("Unable to broadcast terminator condition");
       return -1;
     }
   }
@@ -870,7 +992,7 @@ static int Terminator_decrement(Terminator *terminator)
   return 0;
 }
 
-// this function must be called with the GIL held
+// GIL must be held
 static int Terminator_wait(Terminator *terminator)
 {
   int rc;
@@ -881,7 +1003,7 @@ static int Terminator_wait(Terminator *terminator)
   rc = Terminator_decrement(terminator);
   if (rc != 0)
   {
-    PyErr_SetString(PyExc_RuntimeError, threading_error);
+    PyErr_SetString(PyExc_RuntimeError, "Unable to decrement terminator");
     return rc;
   }
 
@@ -980,7 +1102,7 @@ static void Behavior_free(Behavior *self)
   Py_ssize_t i;
   Request *r;
   Py_DECREF(self->thunk);
-  for (i = 0; r = self->requests, i < self->length; ++i, ++r)
+  for (i = 0, r = self->requests; i < self->length; ++i, ++r)
   {
     Request_free(r);
   }
@@ -995,7 +1117,7 @@ static int Behavior_resolve_one(Behavior *self)
   {
     return 0;
   }
-  
+
   printf("enqueueing behavior\n");
 
   return PCQueue_enqueue(work_queue, self);
@@ -1044,6 +1166,7 @@ static void Request_init(Request *self, RegionObject *region)
 // this must be called while holding the GIL
 static void Request_free(Request *self)
 {
+  printf("freeing request with region %s\n", PyUnicode_AsUTF8(self->target->name));
   Py_DECREF(self->target);
 }
 
@@ -1103,6 +1226,10 @@ static int worker(void *arg)
   int rc;
   PyInterpreterState *interp;
   PyThreadState *ts;
+  PyObject *err_type, *err_value, *err_traceback;
+
+  rc = 0;
+  err_type = err_value = err_traceback = NULL;
 
   printf("worker starting\n");
 
@@ -1116,7 +1243,6 @@ static int worker(void *arg)
   {
     Py_ssize_t i;
     Request *r;
-    PyObject *result;
     PyObject *regions;
     Behavior *b;
 
@@ -1126,15 +1252,6 @@ static int worker(void *arg)
     if (b == NULL)
     {
       printf("received NULL behavior\n");
-      if (threading_error != NULL)
-      {
-        PyEval_RestoreThread(ts);
-        PyErr_SetString(PyExc_RuntimeError, threading_error);
-        PyThreadState_Clear(ts);
-        PyThreadState_DeleteCurrent();
-        return -1;
-      }
-
       // system may be shutting down, so we need to check the terminator again
       continue;
     }
@@ -1146,37 +1263,52 @@ static int worker(void *arg)
     if (regions == NULL)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to allocate regions tuple");
-      PyThreadState_Clear(ts);
-      PyThreadState_DeleteCurrent();
-      return -1;
+      rc = -1;
+      break;
     }
 
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
+      printf("opening region %s\n", PyUnicode_AsUTF8(r->target->name));
       r->target->is_open = true;
       Py_INCREF(r->target);
       PyTuple_SET_ITEM(regions, i, (PyObject *)r->target);
     }
 
-    printf("Calling thunk...\n");
-    result = PyObject_CallObject(b->thunk, regions);
+    if (err_type == NULL)
+    {
+      printf("Calling thunk...\n");
+      PyObject_CallObject(b->thunk, regions);
+      PyErr_Fetch(&err_type, &err_value, &err_traceback);
+      if (err_type != NULL)
+      {
+        BehaviorException_new(err_type, err_value, err_traceback);
+      }
+    }
+    else
+    {
+      printf("Exception thrown in worker, skipping thunk\n");
+    }
     Py_DECREF(regions);
 
     printf("releasing requests\n");
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
+      printf("closing region %s\n", PyUnicode_AsUTF8(r->target->name));
       r->target->is_open = false;
-      Py_DECREF(r->target);
       ts = PyEval_SaveThread();
       rc = Request_release(r);
       PyEval_RestoreThread(ts);
       if (rc != 0)
       {
-        PyErr_SetString(PyExc_RuntimeError, threading_error);
-        PyThreadState_Clear(ts);
-        PyThreadState_DeleteCurrent();
-        return rc;
+        PyErr_SetString(PyExc_RuntimeError, "Unable to release request");
+        continue;
       }
+    }
+
+    if (rc != 0)
+    {
+      break;
     }
 
     printf("freeing behavior\n");
@@ -1187,17 +1319,15 @@ static int worker(void *arg)
 
     if (rc != 0)
     {
-      PyErr_SetString(PyExc_RuntimeError, threading_error);
-      PyThreadState_Clear(ts);
-      PyThreadState_DeleteCurrent();
-      return rc;
+      PyErr_SetString(PyExc_RuntimeError, "Unable to decrement terminator");
+      break;
     }
+  }
 
-    if (result == NULL)
-    {
-      printf("Error in worker thread\n");
-      // TODO log errors somehow
-    }
+  if (rc != 0)
+  {
+    PyErr_Fetch(&err_type, &err_value, &err_traceback);
+    BehaviorException_new(err_type, err_value, err_traceback);
   }
 
   printf("destroying thread and releasing the GIL\n");
@@ -1209,10 +1339,49 @@ static int worker(void *arg)
   return 0;
 }
 
+static int create_subinterpreters()
+{
+  Py_ssize_t i;
+  PyThreadState *ts;
+  printf("creating subinterpreters\n");
+
+  subinterpreters = (PyThreadState **)malloc(sizeof(PyThreadState *) * worker_count);
+  ts = PyThreadState_Get();
+  for (i = 0; i < worker_count; ++i)
+  {
+    printf("subinterpreter %li\n", i);
+    subinterpreters[i] = Py_NewInterpreter();
+    if (subinterpreters[i] == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to create subinterpreter");
+      return -1;
+    }
+  }
+
+  PyThreadState_Swap(ts);
+  return 0;
+}
+
+static void free_subinterpreters()
+{
+  PyThreadState *ts;
+  printf("waiting for workers\n");
+  ts = PyThreadState_Get();
+  for (Py_ssize_t i = 0; i < worker_count; ++i)
+  {
+    printf("ending subinterpreter %li\n", i);
+    PyThreadState_Swap(subinterpreters[i]);
+    Py_EndInterpreter(subinterpreters[i]);
+  }
+
+  free(subinterpreters);
+
+  PyThreadState_Swap(ts);
+}
+
 static int startup_workers()
 {
-  PyInterpreterState *interp;
-  PyThreadState *ts;
+  thrd_t *thr;
   Py_ssize_t i;
   int rc;
   bool expected = false;
@@ -1228,27 +1397,15 @@ static int startup_workers()
   work_queue = PCQueue_new();
   if (work_queue == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, threading_error);
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate work queue");
     return -1;
   }
 
-  printf("creating subinterpreters\n");
-
-  ts = PyThreadState_Get();
-  interp = PyThreadState_GetInterpreter(ts);
-  printf("thread id %lu interp id %li\n", PyThreadState_GetID(ts), PyInterpreterState_GetID(interp));
-  for (i = 0; i < NUM_WORKERS; ++i)
-  {
-    printf("subinterpreter %li\n", i);
-    subinterpreters[i] = Py_NewInterpreter();
-  }
-
-  PyThreadState_Swap(ts);
-
   printf("starting workers\n");
-  for (i = 0; i < NUM_WORKERS; ++i)
+  workers = (thrd_t *)malloc(sizeof(thrd_t) * worker_count);
+  for (i = 0, thr = workers; i < worker_count; ++i, ++thr)
   {
-    rc = thrd_create(&workers[i], worker, subinterpreters[i]->interp);
+    rc = thrd_create(thr, worker, subinterpreters[i]->interp);
     if (rc != thrd_success)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to create worker thread");
@@ -1262,7 +1419,6 @@ static int startup_workers()
 static int shutdown_workers()
 {
   int rc;
-  PyThreadState* _save;
   bool expected = true;
 
   printf("shutting down workers\n");
@@ -1273,34 +1429,26 @@ static int shutdown_workers()
 
   printf("stopping work queue\n");
   Py_BEGIN_ALLOW_THREADS
-  rc = PCQueue_stop(work_queue);
-  Py_END_ALLOW_THREADS
-  if (rc != 0)
+      rc = PCQueue_stop(work_queue);
+  Py_END_ALLOW_THREADS if (rc != 0)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to stop work queue");
     return -1;
   }
 
   printf("waiting for workers\n");
-  _save = PyThreadState_Get();
-  for (Py_ssize_t i = 0; i < NUM_WORKERS; ++i)
+  for (Py_ssize_t i = 0; i < worker_count; ++i)
   {
     printf("joining worker thread %li\n", i);
     Py_BEGIN_ALLOW_THREADS
-    rc = thrd_join(workers[i], NULL);
-    Py_END_ALLOW_THREADS
-    if (rc != thrd_success)
+        rc = thrd_join(workers[i], NULL);
+    Py_END_ALLOW_THREADS if (rc != thrd_success)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to join worker thread");
       return -1;
     }
-
-    printf("ending subinterpreter %li\n", i);
-    PyThreadState_Swap(subinterpreters[i]);
-    Py_EndInterpreter(subinterpreters[i]);
   }
-
-  PyThreadState_Swap(_save);
+  free(workers);
 
   printf("freeing work queue\n");
   PCQueue_free(work_queue);
@@ -1407,12 +1555,12 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
 
   printf("scheduling behavior\n");
   Py_BEGIN_ALLOW_THREADS
-  rc = Behavior_schedule(b);
+      rc = Behavior_schedule(b);
   Py_END_ALLOW_THREADS
 
-  if(rc != 0)
+      if (rc != 0)
   {
-    PyErr_SetString(PyExc_RuntimeError, threading_error);
+    PyErr_SetString(PyExc_RuntimeError, "Unable to schedule behavior");
     return NULL;
   }
 
@@ -2533,8 +2681,24 @@ static bool Region_Check(PyObject *obj)
 /*                  Module setup                               */
 /***************************************************************/
 
+static PyObject *veronapy_run(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
+{
+  if (create_subinterpreters() != 0)
+  {
+    return NULL;
+  }
+
+  if (startup_workers() != 0)
+  {
+    return NULL;
+  }
+
+  Py_RETURN_TRUE;
+}
+
 static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
 {
+  BehaviorException *ex;
   printf("wait\n");
   printf("Waiting for terminator to be set\n");
   if (Terminator_wait(terminator) < 0)
@@ -2552,12 +2716,36 @@ static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ign
 
   printf("done waiting\n");
 
-  Py_RETURN_TRUE;
+  ex = (BehaviorException *)atomic_load(&behavior_exceptions);
+  if (ex != NULL)
+  {
+    while (ex != NULL)
+    {
+      BehaviorException *next = ex->next;
+      if (ex->msg != NULL)
+      {
+        PyErr_Format(WhenError, "%s: %s", ex->name, ex->msg);
+      }
+      else
+      {
+        PyErr_SetString(WhenError, ex->name);
+      }
+      BehaviorException_free(ex);
+      ex = next;
+    }
+
+    free_subinterpreters();
+    return NULL;
+  }
+
+  free_subinterpreters();
+  Py_RETURN_NONE;
 }
 
 static PyMethodDef veronapy_methods[] = {
     {"when", when, METH_VARARGS, "when decorator"},
-    {"wait", (PyCFunction)veronapy_wait, METH_NOARGS, "wait for all regions to complete"},
+    {"wait", (PyCFunction)veronapy_wait, METH_NOARGS, "wait for all behaviors to complete"},
+    {"run", (PyCFunction)veronapy_run, METH_NOARGS, "start the runtime."},
     {NULL} /* Sentinel */
 };
 
@@ -2593,6 +2781,15 @@ static int veronapy_exec(PyObject *module)
     return -1;
   }
 
+  WhenError = PyErr_NewException("veronapy.WhenError", NULL, NULL);
+  Py_XINCREF(WhenError);
+  if (PyModule_AddObject(module, "WhenError", WhenError) < 0)
+  {
+    Py_XDECREF(WhenError);
+    Py_CLEAR(WhenError);
+    return -1;
+  }
+
   Py_INCREF(region_type);
   if (PyModule_AddObject(module, "region", (PyObject *)region_type) <
       0)
@@ -2612,6 +2809,11 @@ static int veronapy_exec(PyObject *module)
   if (PyModule_AddObject(module, "when_factory", (PyObject *)when_type) < 0)
   {
     Py_DECREF(when_type);
+    return -1;
+  }
+
+  if (create_subinterpreters() != 0)
+  {
     return -1;
   }
 
