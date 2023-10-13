@@ -15,7 +15,7 @@ def _sort_section(source: tuple, start: int, end: int, output: region):
     if end - start + 1 <= Threshold:
         # when output:
         @when(output)
-        def _():
+        def _(output):
             print("sorting", start, end)
             output.values = list(sorted(source[start:end + 1]))
 
@@ -29,7 +29,7 @@ def _sort_section(source: tuple, start: int, end: int, output: region):
 
     # when output:
     @when(output, lhs, rhs)
-    def _():
+    def _(output, lhs, rhs):
         print("merging", start, end)
 
         i = 0
@@ -67,7 +67,7 @@ def _main():
 
     # when r:
     @when(output)
-    def _():
+    def _(output):
         print("sorted:", output.values)
 
 

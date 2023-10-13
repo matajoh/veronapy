@@ -30,17 +30,17 @@ def main():
 
     # when r1:
     @when(r1)  # when I have exclusive access to r1...
-    def _():
+    def _(r1):
         print(from_acct, "=", r1.accounts[from_acct].balance)
 
     # when r1:
     @when(r2)  # when I have exclusive access to r2...
-    def _():
+    def _(r2):
         print(to_acct, "=", r2.accounts[to_acct].balance)
 
     # when r1, r2:
     @when(r1, r2)
-    def _():
+    def _(r1, r2):
         r1.accounts[from_acct].balance -= 100
         r2.accounts[to_acct].balance += 100
 
@@ -50,13 +50,13 @@ def main():
 
     # when r2:
     @when(r2)  # when I have exclusive access to r2...
-    def _():
+    def _(r2):
         # guaranteed to see the transfer
         print(to_acct, "=", r2.accounts[to_acct].balance)
 
     # when r1:
     @when(r1)
-    def _():
+    def _(r1):
         # guaranteed to see the transfer
         print(from_acct, "=", r1.accounts[from_acct].balance)
 
