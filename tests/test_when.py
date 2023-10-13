@@ -87,3 +87,10 @@ def test_when_private():
         raise AssertionError
 
     wait()
+
+
+if __name__ == "__main__":
+    test_shareable()
+    test_when()
+    test_detach()
+    test_when_private()

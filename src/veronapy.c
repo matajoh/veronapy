@@ -37,7 +37,7 @@ atomic_llong atomic_decrement(atomic_llong *ptr)
 #define SUBINTERP_GIL
 #endif
 
-//#define VPY_DEBUG
+// #define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 #define PRINTDBG(...) fprintf(stderr, __VA_ARGS__)
@@ -1258,6 +1258,7 @@ static int worker(void *arg)
     ts = PyEval_SaveThread();
     PRINTDBG("waiting for work...\n");
     b = PCQueue_dequeue(work_queue);
+    PyEval_RestoreThread(ts);
     if (b == NULL)
     {
       PRINTDBG("received NULL behavior\n");
@@ -1266,7 +1267,6 @@ static int worker(void *arg)
     }
 
     PRINTDBG("received work\n");
-    PyEval_RestoreThread(ts);
     PRINTDBG("preparing regions...\n");
     regions = PyTuple_New(b->length);
     if (regions == NULL)
@@ -1350,48 +1350,54 @@ static int worker(void *arg)
 
 static int set_worker_count()
 {
-  PyObject* os_module, *os_dict, *sched_getaffinity, *sched_getaffinity_result;
+  PyObject *os_module, *os_dict, *sched_getaffinity, *sched_getaffinity_result;
   char *worker_count_env;
 
   worker_count_env = getenv("VPY_WORKER_COUNT");
-  if(worker_count_env != NULL){
-    PRINTDBG("VPY_WORKER_COUNT: %s\n", buf);
+  if (worker_count_env != NULL)
+  {
+    PRINTDBG("VPY_WORKER_COUNT: %s\n", worker_count_env);
     worker_count = atoi(worker_count_env);
-    if(worker_count < 1){
+    if (worker_count < 1)
+    {
       PyErr_SetString(PyExc_RuntimeError, "VPY_WORKER_COUNT must be greater than 0");
       return -1;
     }
 
-    if(worker_count > 0){
+    if (worker_count > 0)
+    {
       return 0;
     }
   }
 
   PRINTDBG("Unable to load VPY_WORKER_COUNT, using default behavior\n");
   os_module = PyImport_ImportModule("os");
-  if(os_module == NULL){
+  if (os_module == NULL)
+  {
     PyErr_SetString(PyExc_RuntimeError, "Unable to import os module");
     return -1;
   }
 
   os_dict = PyModule_GetDict(os_module);
-  if(os_dict == NULL){
+  if (os_dict == NULL)
+  {
     PyErr_SetString(PyExc_RuntimeError, "Unable to get os module dict");
     return -1;
   }
 
   sched_getaffinity = PyDict_GetItemString(os_dict, "sched_getaffinity");
-  if(sched_getaffinity == NULL){
+  if (sched_getaffinity == NULL)
+  {
     PyErr_SetString(PyExc_RuntimeError, "Unable to get sched_getaffinity from os module");
     return -1;
   }
 
   sched_getaffinity_result = PyObject_CallOneArg(sched_getaffinity, PyLong_FromLong(0));
-  PyObject_Print(sched_getaffinity_result, stdout, 0);
 
   worker_count = PySet_Size(sched_getaffinity_result);
   Py_DECREF(sched_getaffinity_result);
-  if(worker_count < 1){
+  if (worker_count < 1)
+  {
     PyErr_SetString(PyExc_RuntimeError, "sched_getaffinity returned invalid value");
     return -1;
   }
@@ -2835,7 +2841,7 @@ static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ign
   Py_RETURN_NONE;
 }
 
-static PyObject* veronapy_workercount(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
+static PyObject *veronapy_workercount(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
 {
   return PyLong_FromLong(worker_count);
 }
