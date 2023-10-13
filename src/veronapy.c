@@ -3,6 +3,7 @@
 #include <threads.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1347,6 +1348,58 @@ static int worker(void *arg)
   return 0;
 }
 
+static int set_worker_count()
+{
+  PyObject* os_module, *os_dict, *sched_getaffinity, *sched_getaffinity_result;
+  char *worker_count_env;
+
+  worker_count_env = getenv("VPY_WORKER_COUNT");
+  if(worker_count_env != NULL){
+    PRINTDBG("VPY_WORKER_COUNT: %s\n", buf);
+    worker_count = atoi(worker_count_env);
+    if(worker_count < 1){
+      PyErr_SetString(PyExc_RuntimeError, "VPY_WORKER_COUNT must be greater than 0");
+      return -1;
+    }
+
+    if(worker_count > 0){
+      return 0;
+    }
+  }
+
+  PRINTDBG("Unable to load VPY_WORKER_COUNT, using default behavior\n");
+  os_module = PyImport_ImportModule("os");
+  if(os_module == NULL){
+    PyErr_SetString(PyExc_RuntimeError, "Unable to import os module");
+    return -1;
+  }
+
+  os_dict = PyModule_GetDict(os_module);
+  if(os_dict == NULL){
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get os module dict");
+    return -1;
+  }
+
+  sched_getaffinity = PyDict_GetItemString(os_dict, "sched_getaffinity");
+  if(sched_getaffinity == NULL){
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get sched_getaffinity from os module");
+    return -1;
+  }
+
+  sched_getaffinity_result = PyObject_CallOneArg(sched_getaffinity, PyLong_FromLong(0));
+  PyObject_Print(sched_getaffinity_result, stdout, 0);
+
+  worker_count = PySet_Size(sched_getaffinity_result);
+  Py_DECREF(sched_getaffinity_result);
+  if(worker_count < 1){
+    PyErr_SetString(PyExc_RuntimeError, "sched_getaffinity returned invalid value");
+    return -1;
+  }
+
+  PRINTDBG("sched_getaffinity returned %li\n", worker_count);
+  return 0;
+}
+
 static int create_subinterpreters()
 {
   Py_ssize_t i;
@@ -1393,8 +1446,6 @@ static int startup_workers()
   thrd_t *thr;
   Py_ssize_t i;
   int rc;
-
-  // TODO use os.sched_getaffinity(0) to get the number of cores
 
   terminator = Terminator_new();
   work_queue = PCQueue_new();
@@ -2688,6 +2739,12 @@ static int run()
     return 0;
   }
 
+  rc = set_worker_count();
+  if (rc != 0)
+  {
+    return rc;
+  }
+
   rc = create_subinterpreters();
   if (rc != 0)
   {
@@ -2778,10 +2835,16 @@ static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ign
   Py_RETURN_NONE;
 }
 
+static PyObject* veronapy_workercount(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
+{
+  return PyLong_FromLong(worker_count);
+}
+
 static PyMethodDef veronapy_methods[] = {
     {"when", when, METH_VARARGS, "when decorator"},
     {"wait", (PyCFunction)veronapy_wait, METH_NOARGS, "wait for all behaviors to complete"},
     {"run", (PyCFunction)veronapy_run, METH_NOARGS, "start the runtime."},
+    {"worker_count", (PyCFunction)veronapy_workercount, METH_NOARGS, "get the number of workers."},
     {NULL} /* Sentinel */
 };
 
