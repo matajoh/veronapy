@@ -1,25 +1,165 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <threads.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #ifdef _WIN32
 #include <windows.h>
-typedef long long atomic_llong;
+typedef volatile long long atomic_llong;
+typedef PVOID voidptr_t;
+typedef volatile PVOID atomic_voidptr_t;
+typedef volatile LONG atomic_bool;
+typedef CONDITION_VARIABLE cnd_t;
+typedef CRITICAL_SECTION mtx_t;
+typedef HANDLE thrd_t;
+#define thrd_success 0
+#define mtx_plain 0
+typedef int (*thrd_start_t)(void *);
+#define CPU_COUNT "cpu_count"
 
-atomic_llong atomic_fetch_add(atomic_llong *ptr, atomic_llong val)
+atomic_llong atomic_increment(atomic_llong *ptr)
 {
-  return InterlockedExchangeAdd64(ptr, val);
+  return InterlockedIncrement64(ptr);
 }
 
-atomic_llong atomic_fetch_sub(atomic_llong *ptr, atomic_llong val)
+atomic_llong atomic_decrement(atomic_llong *ptr)
 {
-  return InterlockedExchangeAdd64(ptr, -val);
+  return InterlockedDecrement64(ptr);
 }
+
+voidptr_t atomic_exchange_ptr(atomic_voidptr_t *ptr, atomic_voidptr_t val)
+{
+  return InterlockedExchangePointer(ptr, val);
+}
+
+bool atomic_compare_exchange_ptr(atomic_voidptr_t *ptr, atomic_voidptr_t *expected, atomic_voidptr_t desired)
+{
+  atomic_voidptr_t prev;
+
+  prev = InterlockedCompareExchangePointer(ptr, desired, *expected);
+  if (prev == *expected)
+  {
+    return true;
+  }
+
+  *expected = prev;
+  return false;
+}
+
+bool atomic_compare_exchange_bool(atomic_bool *ptr, bool *expected, bool desired)
+{
+  bool prev;
+
+  prev = InterlockedCompareExchange(ptr, desired, *expected);
+  if (prev == *expected)
+  {
+    return true;
+  }
+
+  *expected = prev;
+  return false;
+}
+
+voidptr_t atomic_load_ptr(atomic_voidptr_t *ptr)
+{
+  return *ptr;
+}
+
+bool atomic_load_bool(atomic_bool *ptr)
+{
+  return *ptr;
+}
+
+void atomic_store_bool(atomic_bool *ptr, bool val)
+{
+  InterlockedExchange(ptr, val);
+}
+
+int mtx_init(mtx_t *mtx, int type)
+{
+  InitializeCriticalSection(mtx);
+  return thrd_success;
+}
+
+int mtx_lock(mtx_t *mtx)
+{
+  EnterCriticalSection(mtx);
+  return thrd_success;
+}
+
+int mtx_unlock(mtx_t *mtx)
+{
+  LeaveCriticalSection(mtx);
+  return thrd_success;
+}
+
+int mtx_destroy(mtx_t *mtx)
+{
+  DeleteCriticalSection(mtx);
+  return thrd_success;
+}
+
+int cnd_init(cnd_t *cond)
+{
+  InitializeConditionVariable(cond);
+  return thrd_success;
+}
+
+int cnd_destroy(cnd_t *cond)
+{
+  // Nothing to do
+  return thrd_success;
+}
+
+int cnd_signal(cnd_t *cond)
+{
+  WakeConditionVariable(cond);
+  return thrd_success;
+}
+
+int cnd_broadcast(cnd_t *cond)
+{
+  WakeAllConditionVariable(cond);
+  return thrd_success;
+}
+
+int cnd_wait(cnd_t *cond, mtx_t *mtx)
+{
+  SleepConditionVariableCS(cond, mtx, INFINITE);
+  return thrd_success;
+}
+
+int thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
+{
+  *thr = CreateThread(NULL, 0, func, arg, 0, NULL);
+  if (*thr == NULL)
+  {
+    return GetLastError();
+  }
+
+  return thrd_success;
+}
+
+void thrd_yield()
+{
+  Sleep(0);
+}
+
+int thrd_join(thrd_t thr, int *res)
+{
+  DWORD rc = WaitForSingleObject(thr, INFINITE);
+  if (rc == WAIT_OBJECT_0)
+  {
+    return thrd_success;
+  }
+
+  return GetLastError();
+}
+
 #else
 #include <stdatomic.h>
+#include <threads.h>
 
 atomic_llong atomic_decrement(atomic_llong *ptr)
 {
@@ -275,7 +415,7 @@ atomic_llong atomic_decrement(atomic_llong *ptr)
     region = resolve_region(region);    \
   }
 
-#define VPY_ERROR(x) fprintf(stderr, "veronapy Error: %s\n", x);
+#define VPY_ERROR(x) printf("veronapy Error: %s\n", x);
 
 /***************************************************************/
 /*                     Useful functions                        */
@@ -345,7 +485,7 @@ typedef struct
   PyObject *parent;
   PyObject *objects;
   PyObject *types;
-  atomic_intptr_t last;
+  atomic_voidptr_t last;
 } RegionObject;
 
 static const char *REGION_ATTRS[] = {
@@ -655,7 +795,7 @@ typedef struct behavior_exception_s
   struct behavior_exception_s *next;
 } BehaviorException;
 
-static atomic_intptr_t behavior_exceptions = (intptr_t)NULL;
+static atomic_voidptr_t behavior_exceptions = (intptr_t)NULL;
 static atomic_llong region_identity = 0;
 static atomic_bool running = false;
 static Terminator *terminator;
@@ -671,7 +811,7 @@ static PyThreadState **subinterpreters;
 static void BehaviorException_new(PyObject *type, PyObject *value, PyObject *traceback)
 {
   BehaviorException *ex;
-  intptr_t next;
+  voidptr_t next;
   const char *str;
 
   PRINTDBG("BehaviorException_new %p %p %p\n", type, value, traceback);
@@ -750,7 +890,7 @@ static void BehaviorException_new(PyObject *type, PyObject *value, PyObject *tra
 
   ex->interp = PyInterpreterState_Get();
 
-  next = atomic_exchange(&behavior_exceptions, (intptr_t)ex);
+  next = atomic_exchange_ptr(&behavior_exceptions, (voidptr_t)ex);
   ex->next = (BehaviorException *)next;
   goto end;
 
@@ -794,6 +934,7 @@ static PCQueue *PCQueue_new()
 
   queue->front = NULL;
   queue->back = NULL;
+  queue->active = true;
   if (cnd_init(&queue->available) != thrd_success)
   {
     VPY_ERROR("Unable to initialize queue condition");
@@ -861,14 +1002,15 @@ static int PCQueue_enqueue(PCQueue *queue, Behavior *behavior)
   return 0;
 }
 
-static Behavior *PCQueue_dequeue(PCQueue *queue)
+static int PCQueue_dequeue(PCQueue *queue, Behavior **behavior)
 {
   Node *node;
-  Behavior *behavior;
+
+  *behavior = NULL;
   if (mtx_lock(&queue->mutex) != thrd_success)
   {
     VPY_ERROR("Unable to lock queue mutex");
-    return NULL;
+    return -1;
   }
 
   while (queue->front == NULL && queue->active)
@@ -876,18 +1018,20 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
     if (cnd_wait(&queue->available, &queue->mutex) != thrd_success)
     {
       VPY_ERROR("Unable to wait on queue condition");
-      return NULL;
+      return -1;
     }
   }
 
   if (!queue->active)
   {
+    PRINTDBG("queue is inactive\n");
     if (mtx_unlock(&queue->mutex) != thrd_success)
     {
       VPY_ERROR("Unable to unlock queue mutex");
+      return -1;
     }
 
-    return NULL;
+    return 0;
   }
 
   node = queue->front;
@@ -905,15 +1049,20 @@ static Behavior *PCQueue_dequeue(PCQueue *queue)
   {
     VPY_ERROR("Unable to unlock queue mutex");
     free(node);
-    return NULL;
+    return -1;
   }
 
-  behavior = node->behavior;
-  return behavior;
+  PRINTDBG("dequeued node behavior %p\n", node->behavior);
+  *behavior = node->behavior;
+  free(node);
+  return 0;
 }
 
 static int PCQueue_stop(PCQueue *queue)
 {
+  PRINTDBG("PCQueue_stop\n");
+
+  PRINTDBG("acquiring queue mutex\n");
   if (mtx_lock(&queue->mutex) != thrd_success)
   {
     VPY_ERROR("Unable to lock queue mutex");
@@ -922,15 +1071,19 @@ static int PCQueue_stop(PCQueue *queue)
 
   queue->active = false;
 
-  if (mtx_unlock(&queue->mutex) != thrd_success)
-  {
-    VPY_ERROR("Unable to unlock queue mutex");
-    return -1;
-  }
+  PRINTDBG("broadcasting queue condition\n");
 
   if (cnd_broadcast(&queue->available) != thrd_success)
   {
     VPY_ERROR("Unable to broadcast queue condition");
+    return -1;
+  }
+
+  PRINTDBG("unlocking queue mutex\n");
+
+  if (mtx_unlock(&queue->mutex) != thrd_success)
+  {
+    VPY_ERROR("Unable to unlock queue mutex");
     return -1;
   }
 
@@ -983,14 +1136,14 @@ static void Terminator_free(Terminator *terminator)
 
 static void Terminator_increment(Terminator *terminator)
 {
-  atomic_fetch_add(&terminator->count, 1);
+  atomic_increment(&terminator->count);
 }
 
 static int Terminator_decrement(Terminator *terminator)
 {
   if (atomic_decrement(&terminator->count) == 0)
   {
-    atomic_store(&terminator->set, true);
+    atomic_store_bool(&terminator->set, true);
     if (cnd_broadcast(&terminator->condition) != thrd_success)
     {
       VPY_ERROR("Unable to broadcast terminator condition");
@@ -1016,7 +1169,7 @@ static int Terminator_wait(Terminator *terminator)
     return rc;
   }
 
-  if (atomic_load(&terminator->set))
+  if (atomic_load_bool(&terminator->set))
   {
     return 0;
   }
@@ -1181,10 +1334,10 @@ static void Request_free(Request *self)
 
 static int Request_release(Request *self)
 {
-  intptr_t self_ptr = (intptr_t)self;
+  voidptr_t self_ptr = (voidptr_t)self;
   if (self->next == NULL)
   {
-    if (atomic_compare_exchange_strong(&self->target->last, &self_ptr, (intptr_t)NULL))
+    if (atomic_compare_exchange_ptr(&self->target->last, &self_ptr, (voidptr_t)NULL))
     {
       PRINTDBG("No next request\n");
       return 0;
@@ -1204,8 +1357,8 @@ static int Request_release(Request *self)
 static int Request_start_enqueue(Request *self, Behavior *behavior)
 {
   Request *prev;
-  intptr_t prev_ptr = atomic_exchange(&self->target->last, (intptr_t)self);
-  if (prev_ptr == (intptr_t)NULL)
+  voidptr_t prev_ptr = atomic_exchange_ptr(&self->target->last, (voidptr_t)self);
+  if (prev_ptr == (voidptr_t)NULL)
   {
     PRINTDBG("No previous request\n");
     return Behavior_resolve_one(behavior);
@@ -1248,7 +1401,7 @@ static int worker(void *arg)
   PRINTDBG("thread created %p %p\n", interp, ts);
   PyEval_AcquireThread(ts);
 
-  while (!atomic_load(&terminator->set))
+  while (!atomic_load_bool(&terminator->set))
   {
     Py_ssize_t i;
     Request *r;
@@ -1257,16 +1410,22 @@ static int worker(void *arg)
 
     ts = PyEval_SaveThread();
     PRINTDBG("waiting for work...\n");
-    b = PCQueue_dequeue(work_queue);
+    rc = PCQueue_dequeue(work_queue, &b);
     PyEval_RestoreThread(ts);
+
+    if (rc != 0)
+    {
+      PRINTDBG("error dequeuing work\n");
+      break;
+    }
+
     if (b == NULL)
     {
       PRINTDBG("received NULL behavior\n");
-      // system may be shutting down, so we need to check the terminator again
-      continue;
+      break;
     }
 
-    PRINTDBG("received work\n");
+    PRINTDBG("received work %p\n", b);
     PRINTDBG("preparing regions...\n");
     regions = PyTuple_New(b->length);
     if (regions == NULL)
@@ -1350,7 +1509,7 @@ static int worker(void *arg)
 
 static int set_worker_count()
 {
-  PyObject *os_module, *os_dict, *sched_getaffinity, *sched_getaffinity_result;
+  PyObject *os_module, *os_dict, *cpu_count, *cpu_count_result;
   char *worker_count_env;
 
   worker_count_env = getenv("VPY_WORKER_COUNT");
@@ -1385,24 +1544,32 @@ static int set_worker_count()
     return -1;
   }
 
-  sched_getaffinity = PyDict_GetItemString(os_dict, "sched_getaffinity");
-  if (sched_getaffinity == NULL)
+  cpu_count = PyDict_GetItemString(os_dict, CPU_COUNT);
+  if (cpu_count == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to get sched_getaffinity from os module");
+    PyErr_Format(PyExc_RuntimeError, "Unable to load %s from os module", CPU_COUNT);
     return -1;
   }
 
-  sched_getaffinity_result = PyObject_CallOneArg(sched_getaffinity, PyLong_FromLong(0));
+  if (strcmp(CPU_COUNT, "cpu_count") == 0)
+  {
+    cpu_count_result = PyObject_CallNoArgs(cpu_count);
+    worker_count = PyLong_AsLong(cpu_count_result);
+  }
+  else
+  {
+    cpu_count_result = PyObject_CallOneArg(cpu_count, PyLong_FromLong(0));
+    worker_count = PySet_Size(cpu_count_result);
+  }
 
-  worker_count = PySet_Size(sched_getaffinity_result);
-  Py_DECREF(sched_getaffinity_result);
+  Py_DECREF(cpu_count_result);
   if (worker_count < 1)
   {
-    PyErr_SetString(PyExc_RuntimeError, "sched_getaffinity returned invalid value");
+    PyErr_Format(PyExc_RuntimeError, "%s returned invalid value", CPU_COUNT);
     return -1;
   }
 
-  PRINTDBG("sched_getaffinity returned %li\n", worker_count);
+  PRINTDBG("%s returned %li\n", CPU_COUNT, worker_count);
   return 0;
 }
 
@@ -1423,7 +1590,7 @@ static int create_subinterpreters()
       return -1;
     }
 
-    PRINTDBG("starting subinterpreter %lu\n", subinterpreters[i]->id);
+    PRINTDBG("starting subinterpreter %lu\n", PyInterpreterState_GetID(subinterpreters[i]->interp));
   }
 
   PyThreadState_Swap(ts);
@@ -1437,7 +1604,7 @@ static void free_subinterpreters()
   ts = PyThreadState_Get();
   for (Py_ssize_t i = 0; i < worker_count; ++i)
   {
-    PRINTDBG("ending subinterpreter %lu\n", subinterpreters[i]->id);
+    PRINTDBG("ending subinterpreter %lu\n", PyInterpreterState_GetID(subinterpreters[i]->interp));
     PyThreadState_Swap(subinterpreters[i]);
     Py_EndInterpreter(subinterpreters[i]);
   }
@@ -2333,7 +2500,7 @@ static int Region_init(RegionObject *self, PyObject *args, PyObject *kwds)
   if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &name))
     return -1;
 
-  self->id = atomic_fetch_add(&region_identity, 1);
+  self->id = atomic_increment(&region_identity);
 
   if (name)
   {
@@ -2740,7 +2907,7 @@ static int run()
 {
   int rc;
   bool expected = false;
-  if (!atomic_compare_exchange_strong(&running, &expected, true))
+  if (!atomic_compare_exchange_bool(&running, &expected, true))
   {
     return 0;
   }
@@ -2770,7 +2937,7 @@ static int wait()
 {
   int rc;
   bool expected = true;
-  if (!atomic_compare_exchange_strong(&running, &expected, false))
+  if (!atomic_compare_exchange_bool(&running, &expected, false))
   {
     return 0;
   }
@@ -2795,7 +2962,7 @@ static int wait()
 
   PRINTDBG("done waiting\n");
 
-  ex = (BehaviorException *)atomic_load(&behavior_exceptions);
+  ex = (BehaviorException *)atomic_load_ptr(&behavior_exceptions);
   if (ex != NULL)
   {
     while (ex != NULL)
@@ -2843,7 +3010,7 @@ static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ign
 
 static PyObject *veronapy_workercount(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
 {
-  return PyLong_FromLong(worker_count);
+  return PyLong_FromSsize_t(worker_count);
 }
 
 static PyMethodDef veronapy_methods[] = {
