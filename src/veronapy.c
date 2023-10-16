@@ -156,21 +156,18 @@ int thrd_join(thrd_t thr, int *res)
 
   return GetLastError();
 }
-
 #else
 #include <stdatomic.h>
-#include <threads.h>
 
 typedef intptr_t voidptr_t;
 typedef atomic_intptr_t atomic_voidptr_t;
-#define VPY_WORKER_COUNT_DEFAULT "sched_getaffinity"
 
-atomic_llong atomic_increment(atomic_llong *ptr)
+long long atomic_increment(atomic_llong *ptr)
 {
   return atomic_fetch_add(ptr, 1) + 1;
 }
 
-atomic_llong atomic_decrement(atomic_llong *ptr)
+long long atomic_decrement(atomic_llong *ptr)
 {
   return atomic_fetch_sub(ptr, 1) - 1;
 }
@@ -204,6 +201,84 @@ bool atomic_compare_exchange_bool(atomic_bool *ptr, bool *expected, bool desired
 {
   return atomic_compare_exchange_strong(ptr, expected, desired);
 }
+
+#ifdef __APPLE__
+#include <pthread.h>
+
+typedef pthread_mutex_t mtx_t;
+typedef pthread_cond_t cnd_t;
+typedef pthread_t thrd_t;
+typedef int (*thrd_start_t)(void *);
+
+#define mtx_plain PTHREAD_MUTEX_NORMAL
+#define thrd_success 0
+
+int mtx_init(mtx_t *mtx, int type)
+{
+  return pthread_mutex_init(mtx, NULL);
+}
+
+int mtx_lock(mtx_t *mtx)
+{
+  return pthread_mutex_lock(mtx);
+}
+
+int mtx_unlock(mtx_t *mtx)
+{
+  return pthread_mutex_unlock(mtx);
+}
+
+int mtx_destroy(mtx_t *mtx)
+{
+  return pthread_mutex_destroy(mtx);
+}
+
+int cnd_init(cnd_t *cond)
+{
+  return pthread_cond_init(cond, NULL);
+}
+
+int cnd_destroy(cnd_t *cond)
+{
+  return pthread_cond_destroy(cond);
+}
+
+int cnd_signal(cnd_t *cond)
+{
+  return pthread_cond_signal(cond);
+}
+
+int cnd_broadcast(cnd_t *cond)
+{
+  return pthread_cond_broadcast(cond);
+}
+
+int cnd_wait(cnd_t *cond, mtx_t *mtx)
+{
+  return pthread_cond_wait(cond, mtx);
+}
+
+int thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
+{
+  return pthread_create(thr, NULL, func, arg);
+}
+
+int thrd_yield()
+{
+  return sleep(0);
+}
+
+int thrd_join(thrd_t thr, int *res)
+{
+  return pthread_join(thr, NULL);
+}
+
+#define VPY_WORKER_COUNT_DEFAULT "cpu_count"
+#else
+#include <threads.h>
+#define VPY_WORKER_COUNT_DEFAULT "sched_getaffinity"
+#endif
+
 #endif
 
 /***************************************************************/
@@ -1180,7 +1255,7 @@ static void Terminator_increment(Terminator *terminator)
 
 static int Terminator_decrement(Terminator *terminator)
 {
-  if (atomic_decrement(&terminator->count) == 0)
+  if (atomic_decrement(&terminator->count) == 0LL)
   {
     atomic_store_bool(&terminator->set, true);
     if (cnd_broadcast(&terminator->condition) != thrd_success)
@@ -1314,7 +1389,7 @@ static void Behavior_free(Behavior *self)
 
 static int Behavior_resolve_one(Behavior *self)
 {
-  if (atomic_decrement(&self->count) != 0)
+  if (atomic_decrement(&self->count) != 0LL)
   {
     return 0;
   }
@@ -1591,11 +1666,11 @@ static int set_worker_count()
   }
 
 #ifdef _WIN32
-    cpu_count_result = PyObject_CallNoArgs(cpu_count);
-    worker_count = PyLong_AsLong(cpu_count_result);
+  cpu_count_result = PyObject_CallNoArgs(cpu_count);
+  worker_count = PyLong_AsLong(cpu_count_result);
 #else
-    cpu_count_result = PyObject_CallOneArg(cpu_count, PyLong_FromLong(0));
-    worker_count = PySet_Size(cpu_count_result);
+  cpu_count_result = PyObject_CallOneArg(cpu_count, PyLong_FromLong(0));
+  worker_count = PySet_Size(cpu_count_result);
 #endif
 
   Py_DECREF(cpu_count_result);
@@ -2939,7 +3014,7 @@ static bool Region_Check(PyObject *obj)
 /*                  Module setup                               */
 /***************************************************************/
 
-static int run()
+static int VPY_run()
 {
   int rc;
   bool expected = false;
@@ -2969,7 +3044,7 @@ static int run()
   return 0;
 }
 
-static int wait()
+static int VPY_wait()
 {
   int rc;
   bool expected = true;
@@ -3026,7 +3101,7 @@ static int wait()
 
 static PyObject *veronapy_run(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
 {
-  if (run() != 0)
+  if (VPY_run() != 0)
   {
     return NULL;
   }
@@ -3036,7 +3111,7 @@ static PyObject *veronapy_run(PyObject *veronapymodule, PyObject *Py_UNUSED(igno
 
 static PyObject *veronapy_wait(PyObject *veronapymodule, PyObject *Py_UNUSED(ignored))
 {
-  if (wait() != 0)
+  if (VPY_wait() != 0)
   {
     return NULL;
   }
@@ -3120,7 +3195,7 @@ static int veronapy_exec(PyObject *module)
     return -1;
   }
 
-  return run();
+  return VPY_run();
 }
 
 #ifdef Py_mod_exec
