@@ -16,7 +16,7 @@ typedef HANDLE thrd_t;
 #define thrd_success 0
 #define mtx_plain 0
 typedef int (*thrd_start_t)(void *);
-#define CPU_COUNT "cpu_count"
+#define VPY_WORKER_COUNT_DEFAULT "cpu_count"
 
 atomic_llong atomic_increment(atomic_llong *ptr)
 {
@@ -161,9 +161,48 @@ int thrd_join(thrd_t thr, int *res)
 #include <stdatomic.h>
 #include <threads.h>
 
+typedef intptr_t voidptr_t;
+typedef atomic_intptr_t atomic_voidptr_t;
+#define VPY_WORKER_COUNT_DEFAULT "sched_getaffinity"
+
+atomic_llong atomic_increment(atomic_llong *ptr)
+{
+  return atomic_fetch_add(ptr, 1) + 1;
+}
+
 atomic_llong atomic_decrement(atomic_llong *ptr)
 {
   return atomic_fetch_sub(ptr, 1) - 1;
+}
+
+voidptr_t atomic_load_ptr(atomic_voidptr_t *ptr)
+{
+  return atomic_load(ptr);
+}
+
+bool atomic_load_bool(atomic_bool *ptr)
+{
+  return atomic_load(ptr);
+}
+
+void atomic_store_bool(atomic_bool *ptr, bool val)
+{
+  atomic_store(ptr, val);
+}
+
+voidptr_t atomic_exchange_ptr(atomic_voidptr_t *ptr, atomic_voidptr_t val)
+{
+  return atomic_exchange(ptr, val);
+}
+
+bool atomic_compare_exchange_ptr(atomic_voidptr_t *ptr, voidptr_t *expected, voidptr_t desired)
+{
+  return atomic_compare_exchange_strong(ptr, expected, desired);
+}
+
+bool atomic_compare_exchange_bool(atomic_bool *ptr, bool *expected, bool desired)
+{
+  return atomic_compare_exchange_strong(ptr, expected, desired);
 }
 #endif
 
@@ -1544,32 +1583,29 @@ static int set_worker_count()
     return -1;
   }
 
-  cpu_count = PyDict_GetItemString(os_dict, CPU_COUNT);
+  cpu_count = PyDict_GetItemString(os_dict, VPY_WORKER_COUNT_DEFAULT);
   if (cpu_count == NULL)
   {
-    PyErr_Format(PyExc_RuntimeError, "Unable to load %s from os module", CPU_COUNT);
+    PyErr_Format(PyExc_RuntimeError, "Unable to load %s from os module", VPY_WORKER_COUNT_DEFAULT);
     return -1;
   }
 
-  if (strcmp(CPU_COUNT, "cpu_count") == 0)
-  {
+#ifdef _WIN32
     cpu_count_result = PyObject_CallNoArgs(cpu_count);
     worker_count = PyLong_AsLong(cpu_count_result);
-  }
-  else
-  {
+#else
     cpu_count_result = PyObject_CallOneArg(cpu_count, PyLong_FromLong(0));
     worker_count = PySet_Size(cpu_count_result);
-  }
+#endif
 
   Py_DECREF(cpu_count_result);
   if (worker_count < 1)
   {
-    PyErr_Format(PyExc_RuntimeError, "%s returned invalid value", CPU_COUNT);
+    PyErr_Format(PyExc_RuntimeError, "%s returned invalid value", VPY_WORKER_COUNT_DEFAULT);
     return -1;
   }
 
-  PRINTDBG("%s returned %li\n", CPU_COUNT, worker_count);
+  PRINTDBG("%s returned %li\n", VPY_WORKER_COUNT_DEFAULT, worker_count);
   return 0;
 }
 
