@@ -17,7 +17,6 @@ typedef int thrd_return_t;
 #define thrd_success 0
 #define mtx_plain 0
 typedef int (*thrd_start_t)(void *);
-#define VPY_WORKER_COUNT_DEFAULT "cpu_count"
 
 atomic_llong atomic_increment(atomic_llong *ptr)
 {
@@ -209,7 +208,7 @@ bool atomic_compare_exchange_bool(atomic_bool *ptr, bool *expected, bool desired
 typedef pthread_mutex_t mtx_t;
 typedef pthread_cond_t cnd_t;
 typedef pthread_t thrd_t;
-typedef void* thrd_return_t;
+typedef void *thrd_return_t;
 typedef thrd_return_t (*thrd_start_t)(void *);
 
 #define VPY_PTHREAD
@@ -276,10 +275,8 @@ int thrd_join(thrd_t thr, int *res)
   return pthread_join(thr, NULL);
 }
 
-#define VPY_WORKER_COUNT_DEFAULT "cpu_count"
 #else
 #include <threads.h>
-#define VPY_WORKER_COUNT_DEFAULT "sched_getaffinity"
 typedef int thrd_return_t;
 #endif
 
@@ -295,7 +292,7 @@ typedef int thrd_return_t;
 #define SUBINTERP_GIL
 #endif
 
-#define VPY_DEBUG
+// #define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 #define PRINTDBG(...) fprintf(stderr, __VA_ARGS__)
@@ -1627,7 +1624,7 @@ static thrd_return_t worker(void *arg)
 
 static int set_worker_count()
 {
-  PyObject *os_module, *os_dict, *cpu_count, *cpu_count_result;
+  PyObject *os_module, *os_dict, *function, *result, *key;
   char *worker_count_env;
 
   worker_count_env = getenv("VPY_WORKER_COUNT");
@@ -1662,29 +1659,44 @@ static int set_worker_count()
     return -1;
   }
 
-  cpu_count = PyDict_GetItemString(os_dict, VPY_WORKER_COUNT_DEFAULT);
-  if (cpu_count == NULL)
+  key = PyUnicode_FromString("sched_getaffinity");
+  if (PyDict_Contains(os_dict, key))
   {
-    PyErr_Format(PyExc_RuntimeError, "Unable to load %s from os module", VPY_WORKER_COUNT_DEFAULT);
-    return -1;
+    function = PyDict_GetItemString(os_dict, "sched_getaffinity");
+    if (function == NULL)
+    {
+      Py_DECREF(key);
+      PyErr_Format(PyExc_RuntimeError, "Unable to load sched_getaffinity from os module");
+      return -1;
+    }
+
+    result = PyObject_CallOneArg(function, PyLong_FromLong(0));
+    worker_count = PySet_Size(result);
+    PRINTDBG("sched_getaffinity returned %li\n", worker_count);
+  }
+  else
+  {
+    function = PyDict_GetItemString(os_dict, "cpu_count");
+    if (function == NULL)
+    {
+      Py_DECREF(key);
+      PyErr_Format(PyExc_RuntimeError, "Unable to load cpu_count from os module");
+      return -1;
+    }
+
+    result = PyObject_CallNoArgs(function);
+    worker_count = PyLong_AsLong(result);
+    PRINTDBG("cpu_count returned %li\n", worker_count);
   }
 
-#ifdef _WIN32
-  cpu_count_result = PyObject_CallNoArgs(cpu_count);
-  worker_count = PyLong_AsLong(cpu_count_result);
-#else
-  cpu_count_result = PyObject_CallOneArg(cpu_count, PyLong_FromLong(0));
-  worker_count = PySet_Size(cpu_count_result);
-#endif
-
-  Py_DECREF(cpu_count_result);
+  Py_DECREF(key);
+  Py_DECREF(result);
   if (worker_count < 1)
   {
-    PyErr_Format(PyExc_RuntimeError, "%s returned invalid value", VPY_WORKER_COUNT_DEFAULT);
+    PyErr_SetString(PyExc_RuntimeError, "invalid worker count (< 1)");
     return -1;
   }
 
-  PRINTDBG("%s returned %li\n", VPY_WORKER_COUNT_DEFAULT, worker_count);
   return 0;
 }
 
