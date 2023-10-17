@@ -13,6 +13,7 @@ typedef volatile LONG atomic_bool;
 typedef CONDITION_VARIABLE cnd_t;
 typedef CRITICAL_SECTION mtx_t;
 typedef HANDLE thrd_t;
+typedef int thrd_return_t;
 #define thrd_success 0
 #define mtx_plain 0
 typedef int (*thrd_start_t)(void *);
@@ -208,8 +209,10 @@ bool atomic_compare_exchange_bool(atomic_bool *ptr, bool *expected, bool desired
 typedef pthread_mutex_t mtx_t;
 typedef pthread_cond_t cnd_t;
 typedef pthread_t thrd_t;
-typedef int (*thrd_start_t)(void *);
+typedef void* thrd_return_t;
+typedef thrd_return_t (*thrd_start_t)(void *);
 
+#define VPY_PTHREAD
 #define mtx_plain PTHREAD_MUTEX_NORMAL
 #define thrd_success 0
 
@@ -277,6 +280,7 @@ int thrd_join(thrd_t thr, int *res)
 #else
 #include <threads.h>
 #define VPY_WORKER_COUNT_DEFAULT "sched_getaffinity"
+typedef int thrd_return_t;
 #endif
 
 #endif
@@ -291,7 +295,7 @@ int thrd_join(thrd_t thr, int *res)
 #define SUBINTERP_GIL
 #endif
 
-// #define VPY_DEBUG
+#define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 #define PRINTDBG(...) fprintf(stderr, __VA_ARGS__)
@@ -1497,7 +1501,7 @@ static void Request_finish_enqueue(Request *self)
 // TODO need two versions of this
 // one which works in a global GIL context, and another
 // which works in a per-subinterp gil context
-static int worker(void *arg)
+static thrd_return_t worker(void *arg)
 {
   int rc;
   PyInterpreterState *interp;
@@ -1618,7 +1622,7 @@ static int worker(void *arg)
 
   PRINTDBG("worker exiting\n");
 
-  return 0;
+  return (thrd_return_t)0;
 }
 
 static int set_worker_count()
