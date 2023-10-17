@@ -1,7 +1,7 @@
 """Region tests."""
 
 import json
-from veronapy import region
+from veronapy import region, RegionIsolationError
 
 
 def test_creation():
@@ -73,7 +73,7 @@ def test_parent():
         except AttributeError:
             pass
         else:
-            raise AssertionError("Should have raised RuntimeError")
+            raise AssertionError("Should have raised AttributeError")
 
 
 class MockObject:
@@ -101,7 +101,7 @@ def test_ownership():
         r1.accounts = {"Alice": 1000}
         try:
             r2.accounts = r1.accounts
-        except RuntimeError:
+        except RegionIsolationError:
             # ownership exception
             pass
         else:
@@ -117,7 +117,7 @@ def test_isolation():
 
     try:
         print(x["Alice"])
-    except RuntimeError:
+    except RegionIsolationError:
         # the region not open
         pass
     else:
@@ -135,7 +135,7 @@ def test_ownership_with_merging():
         r1.f = o1              # o1 becomes owned by r1, as does o2
         try:
             r2.f = o2          # Throws an exception as o2 is in r1
-        except RuntimeError:
+        except RegionIsolationError:
             pass
         else:
             raise AssertionError
@@ -150,7 +150,7 @@ def test_region_ownership():
         r1.f = r3        # OK, r3 becomes owned by r1
         try:
             r2.f = r3    # Throws exception since r3 is already owned by r1
-        except RuntimeError:
+        except RegionIsolationError:
             pass
         else:
             raise AssertionError
