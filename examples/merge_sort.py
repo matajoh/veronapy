@@ -56,7 +56,7 @@ def _sort_section(source: tuple, start: int, end: int, output: region):
 
 def _main():
     # Create an immutable list of integers as input
-    values = tuple([random.randint(0, 100) for _ in range(100)])
+    values = tuple([random.randint(0, 1000) for _ in range(1000)])
     print("unsorted:", values)
 
     # Create a region to hold the output
@@ -68,7 +68,10 @@ def _main():
     # when r:
     @when(output)
     def _(output):
-        print("sorted:", output.values)
+        for i in range(len(output.values) - 1):
+            assert output.values[i] <= output.values[i + 1]
+        
+        print("sorted!")
 
 
 if __name__ == "__main__":
