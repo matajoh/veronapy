@@ -17,6 +17,7 @@ typedef int thrd_return_t;
 #define thrd_success 0
 #define mtx_plain 0
 typedef int (*thrd_start_t)(void *);
+typedef __declspec(thread) thread_local;
 
 atomic_llong atomic_increment(atomic_llong *ptr)
 {
@@ -292,7 +293,7 @@ typedef int thrd_return_t;
 #define VPY_MULTIGIL
 #endif
 
-#define VPY_DEBUG
+// #define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 #define PRINTDBG(...) fprintf(stderr, __VA_ARGS__)
@@ -876,7 +877,7 @@ typedef struct behavior_s
   atomic_llong count;
   Py_ssize_t length;
   Request *requests;
-  PyThreadState *tstate;
+  Py_ssize_t alloc_id;
 } Behavior;
 
 typedef struct node_s
@@ -916,7 +917,7 @@ typedef struct freeable_behavior_s
 } FreeableBehavior;
 
 static atomic_voidptr_t behavior_exceptions = (voidptr_t)NULL;
-static atomic_voidptr_t freeable_behaviors = (voidptr_t)NULL;
+static atomic_voidptr_t *freeable_behaviors;
 static atomic_llong region_identity = 0;
 static atomic_bool running = false;
 static Terminator *terminator;
@@ -924,6 +925,7 @@ static PCQueue *work_queue;
 static Py_ssize_t worker_count = 1;
 static thrd_t *workers;
 static PyThreadState **subinterpreters;
+static thread_local Py_ssize_t alloc_id;
 
 // NB Unless otherwise specified, none of the Behavior-related functions
 // require holding the GIL. Since they are being used from multiple different
@@ -1259,13 +1261,31 @@ static int Terminator_decrement(Terminator *terminator)
 
 static void Behavior_free(Behavior *self);
 
+static void free_behaviors()
+{
+  voidptr_t freeable_ptr;
+  FreeableBehavior *freeable;
+
+  freeable_ptr = atomic_exchange_ptr(freeable_behaviors + alloc_id, (voidptr_t)NULL);
+  if (freeable_ptr != (voidptr_t)NULL)
+  {
+    PRINTDBG("Behavior(s) to free\n");
+    freeable = (FreeableBehavior *)freeable_ptr;
+    while (freeable != NULL)
+    {
+      PRINTDBG("Freeing behavior %p next=%p\n", freeable->behavior, freeable->next);
+      FreeableBehavior *next = freeable->next;
+      Behavior_free(freeable->behavior);
+      free(freeable);
+      freeable = next;
+    }
+  }
+}
+
 // GIL must be held
 static int Terminator_wait(Terminator *terminator)
 {
   int rc;
-  PyThreadState *_save;
-  voidptr_t freeable_ptr;
-  FreeableBehavior *freeable;
 
   PRINTDBG("Terminator_wait\n");
 
@@ -1276,48 +1296,17 @@ static int Terminator_wait(Terminator *terminator)
     return rc;
   }
 
-  _save = PyEval_SaveThread();
   while (!atomic_load_bool(&terminator->set))
   {
-    freeable_ptr = atomic_exchange_ptr(&freeable_behaviors, (voidptr_t)NULL);
-    if (freeable_ptr != (voidptr_t)NULL)
-    {
-      PRINTDBG("Behavior(s) to free\n");
-      freeable = (FreeableBehavior *)freeable_ptr;
-      while (freeable != NULL)
-      {
-        PRINTDBG("Freeing behavior %p next=%p\n", freeable->behavior, freeable->next);
-        FreeableBehavior *next = freeable->next;
-        PyEval_RestoreThread(freeable->behavior->tstate);
-        Behavior_free(freeable->behavior);
-        PyEval_SaveThread();
-        free(freeable);
-        freeable = next;
-      }
-    }
+    free_behaviors();
 
+    Py_BEGIN_ALLOW_THREADS
     thrd_yield();
+    Py_END_ALLOW_THREADS
   }
 
-  freeable_ptr = atomic_exchange_ptr(&freeable_behaviors, (voidptr_t)NULL);
-  if (freeable_ptr != (voidptr_t)NULL)
-  {
-    PRINTDBG("Terminator set, freeing final behaviors\n");
-    freeable = (FreeableBehavior *)freeable_ptr;
-    while (freeable != NULL)
-    {
-      PRINTDBG("Freeing behavior %p next=%p\n", freeable->behavior, freeable->next);
-      FreeableBehavior *next = freeable->next;
-      PyEval_RestoreThread(freeable->behavior->tstate);
-      Behavior_free(freeable->behavior);
-      PyEval_SaveThread();
-      free(freeable);
-      freeable = next;
-    }
-  }
+  free_behaviors();
 
-  PRINTDBG("re-acquiring GIL\n");
-  PyEval_RestoreThread(_save);
   PRINTDBG("All work complete.\n");
 
   return 0;
@@ -1343,7 +1332,7 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
 
   Py_INCREF(t);
   b->thunk = t;
-  b->tstate = PyThreadState_GET();
+  b->alloc_id = alloc_id;
 
   PyList_Sort(regions);
   b->length = PyList_Size(regions);
@@ -1499,8 +1488,10 @@ static thrd_return_t worker(void *arg)
   int rc;
   Py_ssize_t index;
   PyThreadState *ts;
-  PyGILState_STATE gstate;
   PyObject *err_type, *err_value, *err_traceback;
+#ifdef VPY_MULTIGIL
+  PyGILState_STATE gstate;
+#endif
 
   rc = 0;
   err_type = err_value = err_traceback = NULL;
@@ -1509,7 +1500,12 @@ static thrd_return_t worker(void *arg)
 
   index = (Py_ssize_t)arg;
   ts = subinterpreters[index];
+  alloc_id = index + 1;
+#ifdef VPY_MULTIGIL
   gstate = PyGILState_Ensure();
+#else
+  PyEval_AcquireThread(ts);
+#endif
 
   while (!atomic_load_bool(&terminator->set))
   {
@@ -1523,6 +1519,8 @@ static thrd_return_t worker(void *arg)
     PRINTDBG("waiting for work...\n");
     rc = PCQueue_dequeue(work_queue, &b);
     PyEval_RestoreThread(ts);
+
+    free_behaviors();
 
     if (rc != 0)
     {
@@ -1598,7 +1596,7 @@ static thrd_return_t worker(void *arg)
       break;
     }
     freeable->behavior = b;
-    freeable->next = (FreeableBehavior *)atomic_exchange(&freeable_behaviors, (voidptr_t)freeable);
+    freeable->next = (FreeableBehavior *)atomic_exchange(freeable_behaviors + b->alloc_id, (voidptr_t)freeable);
 
     PRINTDBG("Decrementing terminator...\n");
     rc = Terminator_decrement(terminator);
@@ -1616,9 +1614,15 @@ static thrd_return_t worker(void *arg)
     BehaviorException_new(err_type, err_value, err_traceback);
   }
 
+  free_behaviors();
+
   PRINTDBG("worker exiting\n");
 
+#ifdef VPY_MULTIGIL
   PyGILState_Release(gstate);
+#else
+  PyEval_ReleaseThread(ts);
+#endif
 
   return (thrd_return_t)0;
 }
@@ -1709,7 +1713,10 @@ static int create_subinterpreters()
 
   PRINTDBG("creating multi-gil subinterpreters\n");
 
+  alloc_id = 0;
   subinterpreters = (PyThreadState **)malloc(sizeof(PyThreadState *) * worker_count);
+  freeable_behaviors = (atomic_voidptr_t *)malloc(sizeof(atomic_voidptr_t) * worker_count);
+  freeable_behaviors[0] = (voidptr_t)NULL;
   for (i = 0; i < worker_count; ++i)
   {
     PyStatus status;
@@ -1723,6 +1730,7 @@ static int create_subinterpreters()
         .gil = PyInterpreterConfig_OWN_GIL,
     };
     subinterpreters[i] = NULL;
+    freeable_behaviors[i + 1] = (voidptr_t)NULL;
 
     ts = PyThreadState_Get();
     status = Py_NewInterpreterFromConfig(subinterpreters + i, &config);
@@ -1751,10 +1759,13 @@ static int create_subinterpreters()
   PRINTDBG("creating subinterpreters\n");
 
   subinterpreters = (PyThreadState **)malloc(sizeof(PyThreadState *) * worker_count);
+  freeable_behaviors = (atomic_voidptr_t *)malloc(sizeof(atomic_voidptr_t) * worker_count);
+  freeable_behaviors[0] = (voidptr_t)NULL;
   ts = PyThreadState_Get();
   for (i = 0; i < worker_count; ++i)
   {
     subinterpreters[i] = Py_NewInterpreter();
+    freeable_behaviors[i + 1] = (voidptr_t)NULL;
     if (subinterpreters[i] == NULL)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to create subinterpreter");
@@ -1777,11 +1788,12 @@ static void free_subinterpreters()
   for (Py_ssize_t i = 0; i < worker_count; ++i)
   {
     PRINTDBG("ending subinterpreter %lu %p\n", PyInterpreterState_GetID(subinterpreters[i]->interp), subinterpreters[i]);
-    PyEval_RestoreThread(subinterpreters[i]);
+    PyThreadState_Swap(subinterpreters[i]);
     Py_EndInterpreter(subinterpreters[i]);
   }
 
   free(subinterpreters);
+  free(freeable_behaviors);
   PyEval_RestoreThread(ts);
 }
 
@@ -3220,7 +3232,7 @@ static int veronapy_exec(PyObject *module)
     return -1;
   }
 
-  PyModule_AddStringConstant(module, "__version__", "0.0.2");
+  PyModule_AddStringConstant(module, "__version__", "0.0.3");
   RegionIsolationError = PyErr_NewException("veronapy.RegionIsolationError", NULL, NULL);
   Py_XINCREF(RegionIsolationError);
   if (PyModule_AddObject(module, "RegionIsolationError", RegionIsolationError) < 0)
