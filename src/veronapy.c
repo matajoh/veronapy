@@ -293,7 +293,7 @@ typedef int thrd_return_t;
 #define VPY_MULTIGIL
 #endif
 
-// #define VPY_DEBUG
+#define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 #define PRINTDBG(...) fprintf(stderr, __VA_ARGS__)
@@ -1554,7 +1554,7 @@ static thrd_return_t worker(void *arg)
 
     if (err_type == NULL)
     {
-      PRINTDBG("Calling thunk...\n");
+      PRINTDBG("Calling thunk %p\n", b->thunk);
       PyObject_CallObject(b->thunk, regions);
       PyErr_Fetch(&err_type, &err_value, &err_traceback);
       if (err_type != NULL)

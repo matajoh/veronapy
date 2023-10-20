@@ -161,4 +161,4 @@ cython_debug/
 
 # Misc
 .vscode
-.env-debug
+.env-*
