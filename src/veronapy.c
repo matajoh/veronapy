@@ -293,7 +293,7 @@ typedef int thrd_return_t;
 #define VPY_MULTIGIL
 #endif
 
-#define VPY_DEBUG
+// #define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 #define PRINTDBG(...) fprintf(stderr, __VA_ARGS__)
@@ -1546,10 +1546,11 @@ static thrd_return_t worker(void *arg)
 
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
-      PRINTDBG("opening region %s\n", PyUnicode_AsUTF8(r->target->name));
-      r->target->is_open = true;
-      Py_INCREF(r->target);
-      PyTuple_SET_ITEM(regions, i, (PyObject *)r->target);
+      VPY_REGION(r->target);
+      PRINTDBG("opening region %s\n", PyUnicode_AsUTF8(region->name));
+      region->is_open = true;
+      Py_INCREF(region);
+      PyTuple_SET_ITEM(regions, i, (PyObject *)region);
     }
 
     if (err_type == NULL)
@@ -1571,8 +1572,9 @@ static thrd_return_t worker(void *arg)
     PRINTDBG("releasing requests\n");
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
-      PRINTDBG("closing region %s\n", PyUnicode_AsUTF8(r->target->name));
-      r->target->is_open = false;
+      VPY_REGION(r->target);
+      PRINTDBG("closing region %s\n", PyUnicode_AsUTF8(region->name));
+      region->is_open = false;
       ts = PyEval_SaveThread();
       rc = Request_release(r);
       PyEval_RestoreThread(ts);
@@ -1715,7 +1717,7 @@ static int create_subinterpreters()
 
   alloc_id = 0;
   subinterpreters = (PyThreadState **)malloc(sizeof(PyThreadState *) * worker_count);
-  freeable_behaviors = (atomic_voidptr_t *)malloc(sizeof(atomic_voidptr_t) * worker_count);
+  freeable_behaviors = (atomic_voidptr_t *)malloc(sizeof(atomic_voidptr_t) * (worker_count + 1));
   freeable_behaviors[0] = (voidptr_t)NULL;
   for (i = 0; i < worker_count; ++i)
   {

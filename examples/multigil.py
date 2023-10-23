@@ -15,7 +15,9 @@ def main():
     regions = [region("r" + str(i)) for i in range(num_regions)]
     for r in regions:
         with r:
-            r.count = 0
+            r.start = 0
+            r.val = 0
+            r.end = 0
 
         r.make_shareable()
 
@@ -23,9 +25,11 @@ def main():
         @when(r)
         def _(r):
             r.start = time.time()
+            val = 0
             for i in range(100000):
-                r.val = pow(i, 7)
+                val = val + i
 
+            r.val = val
             r.end = time.time()
 
     @when(*regions)
@@ -34,7 +38,10 @@ def main():
         jobs.sort()
         start = jobs[0][0]
         for job in jobs:
-            print("Region {}: {:.2f} - {:.2f} ({:.2f}s)".format(job[2], job[0] - start, job[1] - start, job[1] - job[0]))
+            print("Region {}: {:.2f} - {:.2f} ({:.2f}s)".format(job[2],
+                                                                job[0] - start,
+                                                                job[1] - start,
+                                                                job[1] - job[0]))
 
 
 if __name__ == "__main__":
