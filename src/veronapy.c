@@ -17,7 +17,7 @@ typedef int thrd_return_t;
 #define thrd_success 0
 #define mtx_plain 0
 typedef int (*thrd_start_t)(void *);
-typedef __declspec(thread) thread_local;
+#define thread_local __declspec(thread)
 
 atomic_llong atomic_increment(atomic_llong *ptr)
 {
@@ -1599,7 +1599,7 @@ static thrd_return_t worker(void *arg)
       break;
     }
     freeable->behavior = b;
-    freeable->next = (FreeableBehavior *)atomic_exchange(freeable_behaviors + b->alloc_id, (voidptr_t)freeable);
+    freeable->next = (FreeableBehavior *)atomic_exchange_ptr(freeable_behaviors + b->alloc_id, (voidptr_t)freeable);
 
     PRINTDBG("Decrementing terminator...\n");
     rc = Terminator_decrement(terminator);
