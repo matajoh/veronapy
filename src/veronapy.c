@@ -1502,7 +1502,8 @@ static thrd_return_t worker(void *arg)
   ts = subinterpreters[index];
   alloc_id = index + 1;
 #ifdef VPY_MULTIGIL
-  gstate = PyGILState_Ensure();
+  //gstate = PyGILState_Ensure();
+  PyEval_AcquireThread(ts);
 #else
   PyEval_AcquireThread(ts);
 #endif
@@ -1621,7 +1622,8 @@ static thrd_return_t worker(void *arg)
   PRINTDBG("worker exiting\n");
 
 #ifdef VPY_MULTIGIL
-  PyGILState_Release(gstate);
+  PyEval_ReleaseThread(ts);
+  //PyGILState_Release(gstate);
 #else
   PyEval_ReleaseThread(ts);
 #endif
@@ -1786,17 +1788,16 @@ static void free_subinterpreters()
 {
   PyThreadState *ts;
   PRINTDBG("freeing subinterpreters\n");
-  ts = PyEval_SaveThread();
   for (Py_ssize_t i = 0; i < worker_count; ++i)
   {
     PRINTDBG("ending subinterpreter %lu %p\n", PyInterpreterState_GetID(subinterpreters[i]->interp), subinterpreters[i]);
-    PyThreadState_Swap(subinterpreters[i]);
+    ts = PyThreadState_Swap(subinterpreters[i]);
     Py_EndInterpreter(subinterpreters[i]);
+    PyThreadState_Swap(ts);
   }
 
   free(subinterpreters);
   free(freeable_behaviors);
-  PyEval_RestoreThread(ts);
 }
 
 static int startup_workers()
