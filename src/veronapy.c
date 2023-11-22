@@ -1622,8 +1622,10 @@ static thrd_return_t worker(void *arg)
   PRINTDBG("worker exiting\n");
 
 #ifdef VPY_MULTIGIL
-  PyEval_ReleaseThread(ts);
-  //PyGILState_Release(gstate);
+  PyThreadState *nts = PyThreadState_New(ts->interp);
+  PyThreadState_Clear(ts);
+  PyThreadState_DeleteCurrent();
+  subinterpreters[index] = nts;
 #else
   PyEval_ReleaseThread(ts);
 #endif
