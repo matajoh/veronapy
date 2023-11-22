@@ -8,7 +8,7 @@ from veronapy import region, wait, when
 Threshold = 10
 
 
-def _sort_section(source: tuple, start: int, end: int, output: region):
+def sort_section(source: tuple, start: int, end: int, output: region):
     if end < start:
         return
 
@@ -24,8 +24,8 @@ def _sort_section(source: tuple, start: int, end: int, output: region):
     lhs = region("lhs").make_shareable()
     rhs = region("rhs").make_shareable()
     mid = (start + end) // 2
-    _sort_section(source, start, mid, lhs)
-    _sort_section(source, mid + 1, end, rhs)
+    sort_section(source, start, mid, lhs)
+    sort_section(source, mid + 1, end, rhs)
 
     # when output:
     @when(output, lhs, rhs)
@@ -54,7 +54,7 @@ def _sort_section(source: tuple, start: int, end: int, output: region):
         output.values = values
 
 
-def _main():
+def main():
     # Create an immutable list of integers as input
     values = tuple([random.randint(0, 1000) for _ in range(1000)])
     print("unsorted:", values)
@@ -63,7 +63,7 @@ def _main():
     output = region("MergeSort").make_shareable()
 
     # Sort the list
-    _sort_section(values, 0, len(values) - 1, output)
+    sort_section(values, 0, len(values) - 1, output)
 
     # when r:
     @when(output)
@@ -75,5 +75,5 @@ def _main():
 
 
 if __name__ == "__main__":
-    _main()
+    main()
     wait()
