@@ -2,11 +2,12 @@
 
 from typing import Callable
 
-from veronapy import region, RegionIsolationError
+import veronapy as vp
+from conftest import vpy_run
 
 
 def test_container():
-    r = region()
+    r = vp.region()
     with r:
         r.a = [0, 1, 2, 3]
         print(len(r.a))
@@ -55,7 +56,7 @@ class MockNumeric:
 
 
 def test_maths():
-    r = region()
+    r = vp.region()
     a = MockNumeric(0, 1, 2)
     b = MockNumeric(3, 4, 5)
     e_add = a + b
@@ -72,7 +73,12 @@ def test_maths():
 
     try:
         print(x + a)
-    except RegionIsolationError:
+    except vp.RegionIsolationError:
         pass
     else:
         raise AssertionError
+
+
+if __name__ == "__main__":
+    vpy_run(test_container)
+    vpy_run(test_maths)
