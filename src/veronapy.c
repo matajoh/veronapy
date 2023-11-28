@@ -284,6 +284,194 @@ typedef int thrd_return_t;
 #endif
 
 /***************************************************************/
+/*                  Hashtable Implementation                   */
+/***************************************************************/
+
+typedef struct hashtable_entry_s
+{
+  voidptr_t key;
+  voidptr_t value;
+} ht_entry;
+
+typedef struct hashtable_s
+{
+  ht_entry *entries;
+  Py_ssize_t capacity;
+  Py_ssize_t length;
+  bool threadsafe;
+  mtx_t mutex;
+} ht;
+
+static ht *ht_create(Py_ssize_t capacity, bool threadsafe)
+{
+  ht *table = (ht *)malloc(sizeof(ht));
+  if (table == NULL)
+  {
+    return NULL;
+  }
+
+  table->entries = (ht_entry *)calloc(capacity, sizeof(ht_entry));
+  if (table->entries == NULL)
+  {
+    free(table);
+    return NULL;
+  }
+
+  table->capacity = capacity;
+  table->length = 0;
+
+  if (threadsafe)
+  {
+    if (mtx_init(&table->mutex, mtx_plain) != thrd_success)
+    {
+      free(table->entries);
+      free(table);
+      return NULL;
+    }
+    table->threadsafe = true;
+  }
+  else
+  {
+    table->threadsafe = false;
+  }
+
+  return table;
+}
+
+static void ht_free(ht *table)
+{
+  free(table->entries);
+  if (table->threadsafe)
+  {
+    mtx_destroy(&table->mutex);
+  }
+
+  free(table);
+}
+
+#if SIZEOF_VOID_P == 8
+#define HASH_SHIFT 3
+#else
+#define HASH_SHIFT 2
+#endif
+
+static Py_ssize_t hash_key(voidptr_t key)
+{
+  return (Py_ssize_t)(key >> HASH_SHIFT);
+}
+
+static voidptr_t ht_get(ht *table, voidptr_t key)
+{
+  if (table->threadsafe)
+  {
+    mtx_lock(&table->mutex);
+  }
+  Py_ssize_t hash = hash_key(key);
+  Py_ssize_t index = (hash & (table->capacity - 1));
+
+  voidptr_t result = 0;
+  while (table->entries[index].key != 0)
+  {
+    if (table->entries[index].key == key)
+    {
+      result = table->entries[index].value;
+      break;
+    }
+
+    index++;
+    if (index >= table->capacity)
+    {
+      index = 0;
+    }
+  }
+
+  if (table->threadsafe)
+  {
+    mtx_unlock(&table->mutex);
+  }
+
+  return result;
+}
+
+static void ht_set_entry(ht *table, voidptr_t key, voidptr_t value)
+{
+  Py_ssize_t hash = hash_key(key);
+  Py_ssize_t index = (hash & (table->capacity - 1));
+
+  while (table->entries[index].key != 0)
+  {
+    if (table->entries[index].key == key)
+    {
+      table->entries[index].value = value;
+    }
+
+    index++;
+    if (index >= table->capacity)
+    {
+      index = 0;
+    }
+  }
+
+  table->entries[index].key = key;
+  table->entries[index].value = value;
+  table->length++;
+}
+
+static bool ht_expand(ht *table)
+{
+  ht *new_table = ht_create(table->capacity * 2, false);
+  if (new_table == 0)
+  {
+    return false;
+  }
+
+  for (Py_ssize_t i = 0; i < table->capacity; ++i)
+  {
+    ht_entry entry = table->entries[i];
+    if (entry.key != 0)
+    {
+      ht_set_entry(new_table, entry.key, entry.value);
+    }
+  }
+
+  free(table->entries);
+  table->entries = new_table->entries;
+  table->capacity = new_table->capacity;
+  table->length = new_table->length;
+  free(new_table);
+  return true;
+}
+
+static bool ht_set(ht *table, voidptr_t key, voidptr_t value)
+{
+  bool result = true;
+  if (table->threadsafe)
+  {
+    mtx_lock(&table->mutex);
+  }
+
+  if (table->length >= table->capacity / 2)
+  {
+    if (!ht_expand(table))
+    {
+      result = false;
+    }
+  }
+
+  if (result)
+  {
+    ht_set_entry(table, key, value);
+  }
+
+  if (table->threadsafe)
+  {
+    mtx_unlock(&table->mutex);
+  }
+
+  return result;
+}
+
+/***************************************************************/
 /*                     Macros and Defines                      */
 /***************************************************************/
 
@@ -315,21 +503,21 @@ char VPY_DEBUG_FMT_BUF[1024];
   PyTypeObject *type;  \
   _VPY_GETTYPE(type, isolated_type, r)
 
-#define _VPY_GETREGION(n, r)                                                        \
-  RegionTagObject *region_tag;                                                           \
-  region_tag = (RegionTagObject *)PyObject_GetAttrString(self, "__region__");            \
-  if (region_tag == NULL)                                                                \
-  {                                                                                 \
-    PyErr_Clear();                                                                                           \
-    PyObject *long_ptr = PyLong_FromVoidPtr(self);                                  \
-    region_tag = (RegionTagObject *)PyDict_GetItem(vpy_state->object_regions, long_ptr); \
-    if (region_tag == NULL)                                                              \
-    {                                                                               \
-      PyErr_SetString(PyExc_TypeError,                                              \
-                      "error obtaining region of isolated object");                 \
-      return r;                                                                     \
-    }                                                                               \
-  }                                                                                 \
+#define _VPY_GETREGION(n, r)                                                                \
+  RegionTagObject *region_tag;                                                              \
+  region_tag = (RegionTagObject *)PyObject_GetAttrString(self, "__region__");               \
+  if (region_tag == NULL)                                                                   \
+  {                                                                                         \
+    PyErr_Clear();                                                                          \
+                                                                                            \
+    region_tag = (RegionTagObject *)ht_get(vpy_state->imm_object_regions, (voidptr_t)self); \
+    if (region_tag == NULL)                                                                 \
+    {                                                                                       \
+      PyErr_SetString(PyExc_TypeError,                                                      \
+                      "error obtaining region of isolated object");                         \
+      return r;                                                                             \
+    }                                                                                       \
+  }                                                                                         \
   n = region_tag->region;
 
 #define VPY_GETREGION(r) \
@@ -632,9 +820,10 @@ typedef struct region_tag_object_s
 typedef struct vpy_state_s
 {
   PyObject *isolated_types;
-  PyObject *object_regions;
+  ht *imm_object_regions;
 } VPYState;
 
+static ht *global_imm_object_regions;
 static thread_local PyObject *RegionIsolationError;
 static thread_local PyObject *WhenError;
 static thread_local VPYState *vpy_state;
@@ -706,8 +895,7 @@ static RegionObject *region_of(PyObject *value)
   if (tag == NULL)
   {
     PyErr_Clear();
-    PyObject *long_ptr = PyLong_FromVoidPtr(value);
-    tag = (RegionTagObject *)PyDict_GetItem(vpy_state->object_regions, long_ptr);
+    tag = (RegionTagObject *)ht_get(vpy_state->imm_object_regions, (voidptr_t)value);
     if (tag == NULL)
     {
       return NULL;
@@ -909,9 +1097,8 @@ static int capture_object(RegionObject *region, PyObject *value)
   if (rc < 0)
   {
     PyErr_Clear();
-    PyObject *long_ptr = PyLong_FromVoidPtr(value);
-    rc = PyDict_SetItem(vpy_state->object_regions, long_ptr, tag);
-    if (rc < 0)
+    rc = 0;
+    if (!ht_set(vpy_state->imm_object_regions, (voidptr_t)value, (voidptr_t)tag))
     {
       PyErr_SetString(RegionIsolationError, "Unable to set region tag");
       Py_DECREF(tag);
@@ -3219,10 +3406,14 @@ static PyObject *RegionTag_richcompare(PyObject *lhs, PyObject *rhs, int op)
   if (Region_Check(rhs))
   {
     rhs_region = (RegionObject *)rhs;
-  }else if(rhs->ob_type == &RegionTagType){
+  }
+  else if (rhs->ob_type == &RegionTagType)
+  {
     rhs_tag = (RegionTagObject *)rhs;
     rhs_region = rhs_tag->region;
-  }else{
+  }
+  else
+  {
     Py_RETURN_NOTIMPLEMENTED;
   }
 
@@ -3468,8 +3659,8 @@ static int veronapy_exec(PyObject *module)
     return -1;
   }
 
-  vpy_state->object_regions = PyDict_New();
-  if (vpy_state->object_regions == NULL)
+  vpy_state->imm_object_regions = ht_create(128, false);
+  if (vpy_state->imm_object_regions == NULL)
   {
     return -1;
   }
@@ -3488,7 +3679,9 @@ void veronapy_free(PyObject *module)
   if (state != NULL)
   {
     Py_XDECREF(state->isolated_types);
-    Py_XDECREF(state->object_regions);
+    if(state->imm_object_regions != NULL) {
+      ht_free(state->imm_object_regions);
+    }
   }
 }
 
