@@ -24,6 +24,7 @@ def main():
     for r in regions:
         @when(r)
         def _(r):
+            import time
             r.start = time.time()
             val = 0
             for i in range(100000):

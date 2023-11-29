@@ -494,6 +494,7 @@ static bool ht_set(ht *table, voidptr_t key, voidptr_t value)
   return result;
 }
 
+#if 0
 /***************************************************************/
 /*                  Linked-List Implementation                 */
 /***************************************************************/
@@ -560,6 +561,7 @@ static void list_append(list *l, voidptr_t value)
 
   l->length++;
 }
+#endif
 
 /***************************************************************/
 /*                     Macros and Defines                      */
@@ -595,7 +597,7 @@ char VPY_DEBUG_FMT_BUF[1024];
 
 #define _VPY_GETREGION(n, r)                                      \
   RegionTagObject *region_tag;                                    \
-  region_tag = Isolated_region(self);                             \
+  region_tag = get_tag(self, true);                               \
   if (region_tag == NULL)                                         \
   {                                                               \
     PyErr_SetString(PyExc_TypeError,                              \
@@ -892,7 +894,6 @@ typedef struct region_object_s
   bool is_shared;
   PyObject *parent;
   PyObject *objects;
-  list *imm_objects;
   atomic_voidptr_t last;
 } RegionObject;
 
@@ -905,7 +906,7 @@ typedef struct region_tag_object_s
 typedef struct vpy_state_s
 {
   PyObject *isolated_types;
-  ht *imm_object_regions;
+  PyObject *imm_object_regions;
 } VPYState;
 
 static ht *global_imm_object_regions;
@@ -966,6 +967,47 @@ static RegionObject *resolve_region(RegionObject *start)
   return region;
 }
 
+static RegionTagObject *get_tag(PyObject *value, bool with_errors)
+{
+  RegionTagObject *region_tag = (RegionTagObject *)PyObject_GetAttrString(value, "__region__");
+  if (region_tag == NULL)
+  {
+    // possibly an immutable type, try to get the regiontag from the interpreter state
+    PyErr_Clear();
+
+    PyObject *long_key = PyLong_FromVoidPtr(value);
+    region_tag = (RegionTagObject *)PyDict_GetItem(vpy_state->imm_object_regions, long_key);
+    if (region_tag == NULL)
+    {
+      // this could be an immutable type from another interpreter, try the global table
+      region_tag = (RegionTagObject *)ht_get(global_imm_object_regions, (voidptr_t)value);
+      if (region_tag == NULL)
+      {
+        if (with_errors)
+        {
+          PyErr_SetString(PyExc_TypeError, "error obtaining region tag of isolated object");
+        }
+
+        return NULL;
+      }
+
+      // let's cache this for later
+      int rc = PyDict_SetItem((PyObject *)vpy_state->imm_object_regions, long_key, (PyObject *)region_tag);
+      if (rc < 0)
+      {
+        if (with_errors)
+        {
+          PyErr_SetString(PyExc_TypeError, "error caching region tag of isolated object");
+        }
+
+        return NULL;
+      }
+    }
+  }
+
+  return region_tag;
+}
+
 // The region of an object (or an implicit region if the object is not
 // isolated)
 static RegionObject *region_of(PyObject *value)
@@ -976,15 +1018,10 @@ static RegionObject *region_of(PyObject *value)
     return NULL;
   }
 
-  RegionTagObject *tag = (RegionTagObject *)PyObject_GetAttrString(value, "__region__");
+  RegionTagObject *tag = get_tag(value, false);
   if (tag == NULL)
   {
-    PyErr_Clear();
-    tag = (RegionTagObject *)ht_get(vpy_state->imm_object_regions, (voidptr_t)value);
-    if (tag == NULL)
-    {
-      return NULL;
-    }
+    return NULL;
   }
 
   region = tag->region;
@@ -1182,30 +1219,27 @@ static int capture_object(RegionObject *region, PyObject *value)
   if (rc < 0)
   {
     PyErr_Clear();
-    rc = 0;
-    voidptr_t key = (voidptr_t)value;
-    if (!ht_set(vpy_state->imm_object_regions, key, (voidptr_t)tag))
+    PyObject *long_key = PyLong_FromVoidPtr(value);
+    if (long_key == NULL)
+    {
+      Py_DECREF(tag);
+      return -1;
+    }
+    rc = PyDict_SetItem(vpy_state->imm_object_regions, long_key, tag);
+    if (rc < 0)
     {
       PyErr_SetString(RegionIsolationError, "Unable to set region tag");
       Py_DECREF(tag);
       return -1;
     }
 
-    if (region->is_shared)
+    // if the region is shared, we need to add this object to the
+    // global list of immutable type objects
+    if (!ht_set(global_imm_object_regions, (voidptr_t)value, (voidptr_t)tag))
     {
-      // if the region is shared, we need to add this object to the
-      // global list of immutable type objects
-      if (!ht_set(global_imm_object_regions, key, (voidptr_t)tag))
-      {
-        PyErr_SetString(RegionIsolationError, "Unable to set region tag");
-        Py_DECREF(tag);
-        return -1;
-      }
-    }
-    else
-    {
-      // keep track of this for later if the region is shared
-      list_append(region->imm_objects, key);
+      PyErr_SetString(RegionIsolationError, "Unable to set region tag in global object table");
+      Py_DECREF(tag);
+      return -1;
     }
   }
 
@@ -1238,7 +1272,8 @@ typedef struct request_s
 
 typedef struct behavior_s
 {
-  PyObject *thunk;
+  PyObject *thunk_source;
+  PyObject *thunk_locals;
   atomic_llong count;
   Py_ssize_t length;
   Request *requests;
@@ -1648,7 +1683,7 @@ static int Request_start_enqueue(Request *self, Behavior *behavior);
 static void Request_finish_enqueue(Request *self);
 
 // this must be called while holding the GIL
-static Behavior *Behavior_new(PyObject *t, PyObject *regions)
+static Behavior *Behavior_new(PyObject *thunk_source, PyObject *thunk_locals, PyObject *regions)
 {
   Py_ssize_t i;
   Request *r;
@@ -1659,8 +1694,11 @@ static Behavior *Behavior_new(PyObject *t, PyObject *regions)
     return NULL;
   }
 
-  Py_INCREF(t);
-  b->thunk = t;
+  Py_INCREF(thunk_source);
+  b->thunk_source = thunk_source;
+
+  Py_INCREF(thunk_locals);
+  b->thunk_locals = thunk_locals;
 
   PyList_Sort(regions);
   b->length = PyList_Size(regions);
@@ -1888,9 +1926,17 @@ static thrd_return_t worker(void *arg)
 
     if (err_type == NULL)
     {
-      PRINTDBG("Calling thunk %p\n", b->thunk);
-      PyObject_CallObject(b->thunk, regions);
-      PyErr_Fetch(&err_type, &err_value, &err_traceback);
+      PRINTDBG("Running thunk\n");
+      PyObject *result = PyRun_String(PyUnicode_AsUTF8(b->thunk_source), Py_file_input, b->thunk_locals, NULL);
+      if (result == NULL)
+      {
+        PyErr_Fetch(&err_type, &err_value, &err_traceback);
+      }
+      else
+      {
+        Py_DECREF(result);
+      }
+
       if (err_type != NULL)
       {
         BehaviorException_new(err_type, err_value, err_traceback);
@@ -2244,9 +2290,11 @@ static void When_dealloc(WhenObject *self)
 
 static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
 {
-  PyObject *thunk;
+  PyObject *thunk, *thunk_source, *thunk_name, *thunk_locals, *thunk_command;
+  PyObject *inspect, *getsource, *textwrap, *dedent;
   Behavior *b;
   PyObject *regions;
+  Py_ssize_t index;
   int rc;
 
   PRINTDBG("When_call\n");
@@ -2276,8 +2324,111 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
+  inspect = PyImport_ImportModule("inspect");
+  if (inspect == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to import inspect module");
+    return NULL;
+  }
+
+  getsource = PyObject_GetAttrString(inspect, "getsource");
+  if (getsource == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get getsource from inspect module");
+    return NULL;
+  }
+
+  textwrap = PyImport_ImportModule("textwrap");
+  if (textwrap == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to import textwrap module");
+    return NULL;
+  }
+
+  dedent = PyObject_GetAttrString(textwrap, "dedent");
+  if (dedent == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get dedent from textwrap module");
+    return NULL;
+  }
+
+  thunk_source = PyObject_CallOneArg(getsource, thunk);
+  if (thunk_source == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get source of thunk");
+    return NULL;
+  }
+
+  thunk_source = PyObject_CallOneArg(dedent, thunk_source);
+  if (thunk_source == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to dedent thunk source");
+    return NULL;
+  }
+
+  index = PyUnicode_Find(thunk_source, PyUnicode_FromString("def"), 0, PyUnicode_GET_LENGTH(thunk_source), 1);
+  if (index == -1)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to find def in thunk source");
+    return NULL;
+  }
+
+  thunk_source = PyUnicode_Substring(thunk_source, index, PyUnicode_GET_LENGTH(thunk_source));
+
+  thunk_name = PyObject_GetAttrString(thunk, "__name__");
+  if (thunk_name == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get name of thunk");
+    return NULL;
+  }
+
+  thunk_locals = PyDict_New();
+  if (thunk_locals == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to allocate thunk locals");
+    return NULL;
+  }
+
+  thunk_command = PyUnicode_Concat(thunk_name, PyUnicode_FromString("("));
+  // Iterate through the regions, adding them to the code and to the locals
+  for (Py_ssize_t i = 0; i < PyList_Size(regions); ++i)
+  {
+    PyObject *region = PyList_GetItem(regions, i);
+    if (region == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to get region from list");
+      return NULL;
+    }
+
+    PyObject *name = PyUnicode_FromFormat("r_%li", i);
+    if (name == NULL)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to allocate region name");
+      return NULL;
+    }
+
+    if (PyDict_SetItem(thunk_locals, name, region) != 0)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to set region in thunk locals");
+      return NULL;
+    }
+
+    PyUnicode_Append(&thunk_command, name);
+    if (i < PyList_Size(regions) - 1)
+    {
+      PyUnicode_Append(&thunk_command, PyUnicode_FromString(", "));
+    }
+  }
+
+  PyUnicode_Append(&thunk_command, PyUnicode_FromString(")"));
+
+  thunk_source = PyUnicode_Concat(thunk_source, PyUnicode_FromString("\n"));
+  thunk_source = PyUnicode_Concat(thunk_source, thunk_command);
+
+  // PRINTDBG("thunk final: %s\n", PyUnicode_AsUTF8(thunk_source));
+
   PRINTDBG("creating behavior\n");
-  b = Behavior_new(thunk, regions);
+  b = Behavior_new(thunk_source, thunk_locals, regions);
   Py_DECREF(regions);
 
   if (b == NULL)
@@ -2321,39 +2472,6 @@ static PyObject *when(PyObject *module, PyObject *args)
 /***************************************************************/
 /*              Isolated object methods                        */
 /***************************************************************/
-
-static RegionTagObject *Isolated_region(PyObject *self)
-{
-  RegionTagObject *region_tag = (RegionTagObject *)PyObject_GetAttrString(self, "__region__");
-  if (region_tag == NULL)
-  {
-    // possibly an immutable type, try to get the regiontag from the interpreter state
-    PyErr_Clear();
-
-    region_tag = (RegionTagObject *)ht_get(vpy_state->imm_object_regions, (voidptr_t)self);
-    if (region_tag == NULL)
-    {
-      // this could be an immutable type from another interpreter, try the global table
-      region_tag = (RegionTagObject *)ht_get(global_imm_object_regions, (voidptr_t)self);
-      if (region_tag == NULL)
-      {
-        // something has gone wrong, the region tag is missing
-        PyErr_SetString(PyExc_TypeError, "error obtaining region tag of isolated object");
-        return NULL;
-      }
-
-      // let's cache this for later
-      if (!ht_set(vpy_state->imm_object_regions, (voidptr_t)self, (voidptr_t)region_tag))
-      {
-        // something has gone wrong, we couldn't cache the region tag
-        PyErr_SetString(PyExc_TypeError, "error caching region tag of isolated object");
-        return NULL;
-      }
-    }
-  }
-
-  return region_tag;
-}
 
 static void Isolated_finalize(PyObject *self)
 {
@@ -2615,8 +2733,6 @@ static Py_ssize_t ssize_length(Py_ssize_t value)
 
   return length;
 }
-
-mtx_t isolate_lock;
 
 // Creates a new isolated type for the given type
 // The new type will wrap all of the methods of the given type
@@ -2937,8 +3053,6 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
       .slots = slots,
   };
 
-  mtx_lock(&isolate_lock);
-
   Py_INCREF((PyObject *)type);
   PyTypeObject *isolated_type = (PyTypeObject *)PyType_FromSpecWithBases(&spec, (PyObject *)type);
   if (isolated_type == NULL)
@@ -2946,8 +3060,6 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
     PyErr_SetString(PyExc_RuntimeError, "Unable to create isolated type");
     return NULL;
   }
-
-  mtx_unlock(&isolate_lock);
 
   PRINTDBG("created isolated type %p for %s\n", isolated_type, type->tp_name);
 
@@ -3055,10 +3167,6 @@ static void Region_dealloc(RegionObject *self)
   PRINTDBG("deallocating region %llu\n", self->id);
   Py_XDECREF(self->name);
   Py_XDECREF(self->alias);
-  if (self->imm_objects != NULL)
-  {
-    list_free(self->imm_objects);
-  }
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -3085,12 +3193,6 @@ static PyObject *Region_new(PyTypeObject *type, PyObject *args,
     self->id = 0;
     self->objects = PyDict_New();
     if (self->objects == NULL)
-    {
-      Py_DECREF(self);
-      return NULL;
-    }
-    self->imm_objects = list_create();
-    if (self->imm_objects == NULL)
     {
       Py_DECREF(self);
       return NULL;
@@ -3271,33 +3373,6 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 static PyObject *Region_makeshareable(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
   VPY_REGION(self);
-
-  if (self->imm_objects->length > 0)
-  {
-    ht_lock(global_imm_object_regions);
-    Py_ssize_t required_length = global_imm_object_regions->length + self->imm_objects->length;
-    if (!ht_expand_if_needed(global_imm_object_regions, required_length))
-    {
-      ht_unlock(global_imm_object_regions);
-      PyErr_SetString(PyExc_RuntimeError, "Unable to make region shareable");
-      return NULL;
-    }
-
-    list_node *curr = self->imm_objects->head;
-    while (curr != NULL)
-    {
-      voidptr_t key = curr->value;
-      voidptr_t tag = ht_get(vpy_state->imm_object_regions, key);
-      if (!ht_set(global_imm_object_regions, key, tag))
-      {
-        ht_unlock(global_imm_object_regions);
-        PyErr_SetString(PyExc_RuntimeError, "Unable to make region shareable");
-        return NULL;
-      }
-    }
-
-    ht_unlock(global_imm_object_regions);
-  }
 
   region->is_shared = true;
   region->last = 0;
@@ -3631,10 +3706,10 @@ static int VPY_run()
     return 0;
   }
 
-  rc = mtx_init(&isolate_lock, mtx_plain);
-  if (rc != thrd_success)
+  global_imm_object_regions = ht_create(128, true);
+  if (global_imm_object_regions == NULL)
   {
-    return rc;
+    return -1;
   }
 
   rc = set_worker_count();
@@ -3711,7 +3786,7 @@ static int VPY_wait()
 
   free_subinterpreters();
 
-  mtx_destroy(&isolate_lock);
+  ht_free(global_imm_object_regions);
 
   return 0;
 }
@@ -3832,7 +3907,7 @@ static int veronapy_exec(PyObject *module)
     return -1;
   }
 
-  vpy_state->imm_object_regions = ht_create(128, false);
+  vpy_state->imm_object_regions = PyDict_New();
   if (vpy_state->imm_object_regions == NULL)
   {
     return -1;
@@ -3852,10 +3927,7 @@ void veronapy_free(PyObject *module)
   if (state != NULL)
   {
     Py_XDECREF(state->isolated_types);
-    if (state->imm_object_regions != NULL)
-    {
-      ht_free(state->imm_object_regions);
-    }
+    Py_XDECREF(state->imm_object_regions);
   }
 }
 

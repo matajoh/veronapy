@@ -28,11 +28,22 @@ def sort_section(source: tuple, start: int, end: int, output: region):
         return
 
     if end - start + 1 <= Threshold:
+        unsorted = region("unsorted_{}_{}".format(start, end))
+        with unsorted:
+            unsorted.start = start
+            unsorted.end = end
+            unsorted.values = list(source[start:end + 1])
+        
+        unsorted.make_shareable()
+
         # when output:
-        @when(output)
-        def _(output):
-            print(threading.get_native_id(), "sorting", start, end)
-            output.values = list(sorted(source[start:end + 1]))
+        @when(unsorted, output)
+        def _(unsorted, output):
+            import threading
+            print(threading.get_native_id(), "sorting", unsorted.start, unsorted.end)
+            unsorted.values.sort()
+            merge = output.merge(unsorted)
+            output.values = merge.values
 
         return
 
@@ -56,7 +67,8 @@ def sort_section(source: tuple, start: int, end: int, output: region):
     # when output:
     @when(output, lhs, rhs)
     def _(output, lhs, rhs):
-        print(threading.get_native_id(), "merging", start, end)
+        import threading
+        print(threading.get_native_id(), "merging", lhs.start, rhs.end)
 
         """        lhs = output.merge(lhs)
         rhs = output.merge(rhs)
@@ -83,7 +95,7 @@ def sort_section(source: tuple, start: int, end: int, output: region):
 
         output.values = values
         """
-        print(threading.get_native_id(), "merged", start, end)
+        print(threading.get_native_id(), "merged", lhs.start, rhs.end)
 
 
 def main():
