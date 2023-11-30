@@ -573,7 +573,7 @@ static void list_append(list *l, voidptr_t value)
 #define VPY_MULTIGIL
 #endif
 
-// #define VPY_DEBUG
+#define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 char VPY_DEBUG_FMT_BUF[1024];
@@ -582,13 +582,13 @@ char VPY_DEBUG_FMT_BUF[1024];
 #define PRINTDBG(...)
 #endif
 
-#define _VPY_GETTYPE(n, i, r)                                                  \
-  n = (PyTypeObject *)PyDict_GetItemString(PyType_GetDict(i), "__isolated__"); \
-  if (n == NULL)                                                               \
-  {                                                                            \
-    PyErr_SetString(PyExc_TypeError,                                           \
-                    "error obtaining internal type of isolated object");       \
-    return r;                                                                  \
+#define _VPY_GETTYPE(n, i, r)                                            \
+  n = get_type(i);                                                       \
+  if (n == NULL)                                                         \
+  {                                                                      \
+    PyErr_SetString(PyExc_TypeError,                                     \
+                    "error obtaining internal type of isolated object"); \
+    return r;                                                            \
   }
 
 #define VPY_GETTYPE(r) \
@@ -880,6 +880,53 @@ static bool is_imm(PyObject *value)
   return false;
 }
 
+static PyObject *get_source(PyObject *obj)
+{
+  PyObject *inspect = PyImport_ImportModule("inspect");
+  if (inspect == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to import inspect module");
+    return NULL;
+  }
+
+  PyObject *getsource = PyObject_GetAttrString(inspect, "getsource");
+  if (getsource == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get getsource from inspect module");
+    return NULL;
+  }
+
+  PyObject *textwrap = PyImport_ImportModule("textwrap");
+  if (textwrap == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to import textwrap module");
+    return NULL;
+  }
+
+  PyObject *dedent = PyObject_GetAttrString(textwrap, "dedent");
+  if (dedent == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get dedent from textwrap module");
+    return NULL;
+  }
+
+  PyObject *source = PyObject_CallOneArg(getsource, obj);
+  if (source == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to get source of object");
+    return NULL;
+  }
+
+  source = PyObject_CallOneArg(dedent, source);
+  if (source == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to dedent thunk source");
+    return NULL;
+  }
+
+  return source;
+}
+
 /***************************************************************/
 /*              Region struct and functions                    */
 /***************************************************************/
@@ -906,10 +953,14 @@ typedef struct region_tag_object_s
 typedef struct vpy_state_s
 {
   PyObject *isolated_types;
+  PyObject *frozen_types;
   PyObject *imm_object_regions;
 } VPYState;
 
 static ht *global_imm_object_regions;
+static ht *global_frozen_types;
+static atomic_llong frozen_type_count = 0;
+
 static thread_local PyObject *RegionIsolationError;
 static thread_local PyObject *WhenError;
 static thread_local VPYState *vpy_state;
@@ -967,42 +1018,108 @@ static RegionObject *resolve_region(RegionObject *start)
   return region;
 }
 
+static PyTypeObject *get_type(PyTypeObject *isolated_type)
+{
+  printf("get_type?\n");
+  PRINTDBG("get_type %p\n", isolated_type);
+  PyTypeObject *type;
+  PyObject *type_id_long = (PyObject *)PyDict_GetItemString(PyType_GetDict(isolated_type), "__isolated__");
+  if (type_id_long == NULL)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error obtaining internal type ID of isolated object");
+    return NULL;
+  }
+
+  if (PyType_Check(type_id_long))
+  {
+    type = (PyTypeObject *)type_id_long;
+    PRINTDBG("get_type frozen type is a built-in or extension type %s\n", type->tp_name);
+    return type;
+  }
+
+  PyObject *type_tuple = PyDict_GetItem(vpy_state->frozen_types, type_id_long);
+  if (type_tuple != NULL)
+  {
+    type = (PyTypeObject *)PyTuple_GET_ITEM(type_tuple, 0);
+    PRINTDBG("type was cached on the interpreter %s\n", type->tp_name);
+    return type;
+  }
+
+  long long type_id = PyLong_AsLongLong(type_id_long);
+  PRINTDBG("Need to load type %li from global table and compile on this interpreter", type_id);
+
+  // need to load this type into the interpreter
+  PyObject *source = (PyObject *)ht_get(global_frozen_types, (voidptr_t)type_id);
+  if (source == NULL)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error obtaining source code for internal type of isolated object");
+    return NULL;
+  }
+
+  PyObject *ns = PyDict_New();
+  type = (PyTypeObject *)PyRun_String(PyUnicode_AsUTF8(source), Py_file_input, ns, NULL);
+  Py_DECREF(ns);
+  if (type == NULL)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error loading internal type of isolated object");
+    return NULL;
+  }
+
+  PRINTDBG("Type loaded %s\n", type->tp_name);
+
+  type_tuple = PyTuple_Pack(2, (PyObject *)type, source);
+  if (type_tuple == NULL)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error creating tuple for internal type of isolated object");
+    return NULL;
+  }
+
+  int rc = PyDict_SetItem(vpy_state->frozen_types, type_id_long, type_tuple);
+  if (rc < 0)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error caching internal type of isolated object");
+    return NULL;
+  }
+
+  return type;
+}
+
 static RegionTagObject *get_tag(PyObject *value, bool with_errors)
 {
-  RegionTagObject *region_tag = (RegionTagObject *)PyObject_GetAttrString(value, "__region__");
+  PyObject *long_key = PyLong_FromVoidPtr(value);
+  RegionTagObject *region_tag = (RegionTagObject *)PyDict_GetItem(vpy_state->imm_object_regions, long_key);
+  if (region_tag != NULL)
+  {
+    return region_tag;
+  }
+
+  // this could be an immutable type from another interpreter, try the global table
+  region_tag = (RegionTagObject *)ht_get(global_imm_object_regions, (voidptr_t)value);
   if (region_tag == NULL)
   {
-    // possibly an immutable type, try to get the regiontag from the interpreter state
-    PyErr_Clear();
-
-    PyObject *long_key = PyLong_FromVoidPtr(value);
-    region_tag = (RegionTagObject *)PyDict_GetItem(vpy_state->imm_object_regions, long_key);
-    if (region_tag == NULL)
+    if (with_errors)
     {
-      // this could be an immutable type from another interpreter, try the global table
-      region_tag = (RegionTagObject *)ht_get(global_imm_object_regions, (voidptr_t)value);
-      if (region_tag == NULL)
-      {
-        if (with_errors)
-        {
-          PyErr_SetString(PyExc_TypeError, "error obtaining region tag of isolated object");
-        }
-
-        return NULL;
-      }
-
-      // let's cache this for later
-      int rc = PyDict_SetItem((PyObject *)vpy_state->imm_object_regions, long_key, (PyObject *)region_tag);
-      if (rc < 0)
-      {
-        if (with_errors)
-        {
-          PyErr_SetString(PyExc_TypeError, "error caching region tag of isolated object");
-        }
-
-        return NULL;
-      }
+      PyErr_SetString(PyExc_TypeError, "error obtaining region tag of isolated object");
     }
+
+    return NULL;
+  }
+
+  // let's cache this for later
+  int rc = PyDict_SetItem((PyObject *)vpy_state->imm_object_regions, long_key, (PyObject *)region_tag);
+  if (rc < 0)
+  {
+    if (with_errors)
+    {
+      PyErr_SetString(PyExc_TypeError, "error caching region tag of isolated object");
+    }
+
+    return NULL;
   }
 
   return region_tag;
@@ -1013,11 +1130,6 @@ static RegionTagObject *get_tag(PyObject *value, bool with_errors)
 static RegionObject *region_of(PyObject *value)
 {
   RegionObject *region;
-  if (PyObject_HasAttrString(value, "__region__") == 0)
-  {
-    return NULL;
-  }
-
   RegionTagObject *tag = get_tag(value, false);
   if (tag == NULL)
   {
@@ -1214,33 +1326,25 @@ static int capture_object(RegionObject *region, PyObject *value)
   }
 
   Py_INCREF(tag);
-  rc = PyObject_SetAttrString(value, "__region__", tag);
-
+  PyObject *long_key = PyLong_FromVoidPtr(value);
+  if (long_key == NULL)
+  {
+    Py_DECREF(tag);
+    return -1;
+  }
+  rc = PyDict_SetItem(vpy_state->imm_object_regions, long_key, tag);
   if (rc < 0)
   {
-    PyErr_Clear();
-    PyObject *long_key = PyLong_FromVoidPtr(value);
-    if (long_key == NULL)
-    {
-      Py_DECREF(tag);
-      return -1;
-    }
-    rc = PyDict_SetItem(vpy_state->imm_object_regions, long_key, tag);
-    if (rc < 0)
-    {
-      PyErr_SetString(RegionIsolationError, "Unable to set region tag");
-      Py_DECREF(tag);
-      return -1;
-    }
+    PyErr_SetString(RegionIsolationError, "Unable to set region tag");
+    Py_DECREF(tag);
+    return -1;
+  }
 
-    // if the region is shared, we need to add this object to the
-    // global list of immutable type objects
-    if (!ht_set(global_imm_object_regions, (voidptr_t)value, (voidptr_t)tag))
-    {
-      PyErr_SetString(RegionIsolationError, "Unable to set region tag in global object table");
-      Py_DECREF(tag);
-      return -1;
-    }
+  if (!ht_set(global_imm_object_regions, (voidptr_t)value, (voidptr_t)tag))
+  {
+    PyErr_SetString(RegionIsolationError, "Unable to set region tag in global object table");
+    Py_DECREF(tag);
+    return -1;
   }
 
   Py_INCREF((PyObject *)isolated_type);
@@ -2291,7 +2395,6 @@ static void When_dealloc(WhenObject *self)
 static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
 {
   PyObject *thunk, *thunk_source, *thunk_name, *thunk_locals, *thunk_command;
-  PyObject *inspect, *getsource, *textwrap, *dedent;
   Behavior *b;
   PyObject *regions;
   Py_ssize_t index;
@@ -2324,45 +2427,10 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
-  inspect = PyImport_ImportModule("inspect");
-  if (inspect == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to import inspect module");
-    return NULL;
-  }
-
-  getsource = PyObject_GetAttrString(inspect, "getsource");
-  if (getsource == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to get getsource from inspect module");
-    return NULL;
-  }
-
-  textwrap = PyImport_ImportModule("textwrap");
-  if (textwrap == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to import textwrap module");
-    return NULL;
-  }
-
-  dedent = PyObject_GetAttrString(textwrap, "dedent");
-  if (dedent == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to get dedent from textwrap module");
-    return NULL;
-  }
-
-  thunk_source = PyObject_CallOneArg(getsource, thunk);
+  thunk_source = get_source(thunk);
   if (thunk_source == NULL)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to get source of thunk");
-    return NULL;
-  }
-
-  thunk_source = PyObject_CallOneArg(dedent, thunk_source);
-  if (thunk_source == NULL)
-  {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to dedent thunk source");
     return NULL;
   }
 
@@ -2476,7 +2544,7 @@ static PyObject *when(PyObject *module, PyObject *args)
 static void Isolated_finalize(PyObject *self)
 {
   PyTypeObject *isolated_type = Py_TYPE(self);
-  PyTypeObject *type = (PyTypeObject *)PyDict_GetItemString(PyType_GetDict(isolated_type), "__isolated__");
+  PyTypeObject *type = get_type(isolated_type);
   if (type == NULL)
   {
     PyErr_SetString(PyExc_TypeError,
@@ -2523,6 +2591,8 @@ static PyObject *Isolated_richcompare(PyObject *self, PyObject *other, int op)
   VPY_GETTYPE(NULL);
   VPY_GETREGION(NULL);
   VPY_CHECKREGIONOPEN(NULL);
+
+  PRINTDBG("Isolated_richcompare %s\n", PyUnicode_AsUTF8(region->name));
 
   self->ob_type = type;
   result = type->tp_richcompare(self, other, op);
@@ -2732,6 +2802,52 @@ static Py_ssize_t ssize_length(Py_ssize_t value)
   } while (value != 0);
 
   return length;
+}
+
+static int make_immortal(PyObject *obj)
+{
+  Py_SET_REFCNT(obj, _Py_IMMORTAL_REFCNT);
+
+  PyObject **dict_ptr = _PyObject_GetDictPtr(obj);
+  if (dict_ptr == NULL)
+  {
+    return 0;
+  }
+
+  PyObject *dict = *dict_ptr;
+  if (dict == NULL)
+  {
+    return 0;
+  }
+
+  PyObject *keys = PyDict_Keys(dict);
+  if (keys == NULL)
+  {
+    return -1;
+  }
+
+  Py_ssize_t length = PyList_Size(keys);
+  for (Py_ssize_t i = 0; i < length; ++i)
+  {
+    PyObject *key = PyList_GetItem(keys, i);
+    if (key == NULL)
+    {
+      return -1;
+    }
+
+    PyObject *value = PyDict_GetItem(*dict_ptr, key);
+    if (value == NULL)
+    {
+      return -1;
+    }
+
+    if (make_immortal(value) < 0)
+    {
+      return -1;
+    }
+  }
+
+  return 0;
 }
 
 // Creates a new isolated type for the given type
@@ -3063,17 +3179,67 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
 
   PRINTDBG("created isolated type %p for %s\n", isolated_type, type->tp_name);
 
-  Py_INCREF((PyObject *)type);
-  if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__isolated__",
-                           (PyObject *)type) < 0)
+  PyObject *source = get_source((PyObject *)type);
+  if (source == NULL)
+  {
+    // this is a builtin type or an extension type. We freeze it and hope for the best.
+    PyErr_Clear();
+
+    Py_INCREF((PyObject *)type);
+    if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__isolated__", (PyObject *)type) < 0)
+    {
+      Py_DECREF((PyObject *)isolated_type);
+      PyErr_SetString(PyExc_TypeError,
+                      "error adding internal type to isolated type dictionary");
+      return NULL;
+    }
+
+    type->tp_flags = Py_TPFLAGS_IMMUTABLETYPE | type->tp_flags;
+    if (make_immortal((PyObject *)type) < 0)
+    {
+      PyErr_SetString(PyExc_RuntimeError, "Unable to make type immortal");
+      return NULL;
+    }
+
+    return isolated_type;
+  }
+
+  long long type_id = atomic_increment(&frozen_type_count);
+  PyObject *type_id_long = PyLong_FromLongLong(type_id);
+
+  if (PyDict_SetItemString(PyType_GetDict(isolated_type), "__isolated__", type_id_long) < 0)
   {
     Py_DECREF((PyObject *)isolated_type);
     PyErr_SetString(PyExc_TypeError,
-                    "error adding internal type to isolated type dictionary");
+                    "error adding frozen type source to isolated type dictionary");
     return NULL;
   }
 
-  type->tp_flags = Py_TPFLAGS_IMMUTABLETYPE | type->tp_flags;
+  PyObject *type_tuple = PyTuple_Pack(2, (PyObject *)type, source);
+  if (type_tuple == NULL)
+  {
+    Py_DECREF((PyObject *)isolated_type);
+    PyErr_SetString(PyExc_TypeError,
+                    "error creating frozen type tuple");
+    return NULL;
+  }
+
+  if (PyDict_SetItem(vpy_state->frozen_types, type_id_long, type_tuple) < 0)
+  {
+    Py_DECREF((PyObject *)isolated_type);
+    PyErr_SetString(PyExc_TypeError,
+                    "error adding frozen type to frozen types dictionary");
+    return NULL;
+  }
+
+  if (!ht_set(global_frozen_types, (voidptr_t)type_id, (voidptr_t)source))
+  {
+    Py_DECREF((PyObject *)isolated_type);
+    PyErr_SetString(PyExc_TypeError,
+                    "error adding frozen type source to global frozen types dictionary");
+    return NULL;
+  }
+
   return isolated_type;
 }
 
@@ -3712,6 +3878,12 @@ static int VPY_run()
     return -1;
   }
 
+  global_frozen_types = ht_create(128, true);
+  if (global_frozen_types == NULL)
+  {
+    return -1;
+  }
+
   rc = set_worker_count();
   if (rc != 0)
   {
@@ -3909,6 +4081,12 @@ static int veronapy_exec(PyObject *module)
 
   vpy_state->imm_object_regions = PyDict_New();
   if (vpy_state->imm_object_regions == NULL)
+  {
+    return -1;
+  }
+
+  vpy_state->frozen_types = PyDict_New();
+  if (vpy_state->frozen_types == NULL)
   {
     return -1;
   }

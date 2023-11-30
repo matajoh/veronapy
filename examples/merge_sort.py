@@ -2,6 +2,7 @@
 
 import random
 import threading
+import time
 
 from veronapy import region, wait, when
 
@@ -39,8 +40,6 @@ def sort_section(source: tuple, start: int, end: int, output: region):
         # when output:
         @when(unsorted, output)
         def _(unsorted, output):
-            import threading
-            print(threading.get_native_id(), "sorting", unsorted.start, unsorted.end)
             unsorted.values.sort()
             merge = output.merge(unsorted)
             output.values = merge.values
@@ -67,10 +66,7 @@ def sort_section(source: tuple, start: int, end: int, output: region):
     # when output:
     @when(output, lhs, rhs)
     def _(output, lhs, rhs):
-        import threading
-        print(threading.get_native_id(), "merging", lhs.start, rhs.end)
-
-        """        lhs = output.merge(lhs)
+        lhs = output.merge(lhs)
         rhs = output.merge(rhs)
         i = 0
         j = 0
@@ -94,13 +90,11 @@ def sort_section(source: tuple, start: int, end: int, output: region):
             j += 1
 
         output.values = values
-        """
-        print(threading.get_native_id(), "merged", lhs.start, rhs.end)
 
 
 def main():
     # Create an immutable list of integers as input
-    values = tuple([Item(random.randint(0, 100)) for _ in range(1000)])
+    values = tuple([Item(random.randint(0, 100)) for _ in range(100)])
     print("unsorted:", values)
 
     # Create a region to hold the output
@@ -129,5 +123,8 @@ def main():
 
 
 if __name__ == "__main__":
+    start = time.time()
     main()
     wait()
+    elapsed = time.time() - start
+    print("time taken:", elapsed)
