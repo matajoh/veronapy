@@ -543,7 +543,7 @@ char VPY_DEBUG_FMT_BUF[1024];
 #define VPY_CHECKARG0REGION(ret)                                 \
   PyTypeObject *arg0_type = Py_TYPE(arg0);                       \
   PyTypeObject *arg0_isolated_type = arg0_type;                  \
-  RegionObject *arg0_region = region_of(arg0);                   \
+  RegionObject *arg0_region = get_region(arg0);                  \
   if (arg0_region == NULL)                                       \
   {                                                              \
     arg0_type = arg0_isolated_type;                              \
@@ -566,7 +566,7 @@ char VPY_DEBUG_FMT_BUF[1024];
 #define VPY_CHECKARG1REGION(ret)                                  \
   PyTypeObject *arg1_type = Py_TYPE(arg1);                        \
   PyTypeObject *arg1_isolated_type = arg1_type;                   \
-  RegionObject *arg1_region = region_of(arg1);                    \
+  RegionObject *arg1_region = get_region(arg1);                   \
   if (arg1_region == NULL)                                        \
   {                                                               \
     arg1_type = arg1_isolated_type;                               \
@@ -770,6 +770,11 @@ static void print_debug(char *fmt, ...)
 }
 #endif
 
+/**
+ * Check if a value is immutable. This is done either by seeing if it is one of the
+ * basic immutable types, or by checking if it is a tuple or frozenset containing
+ * only immutable values.
+ */
 static bool is_imm(PyObject *value)
 {
   if (Py_IsNone(value) || PyBool_Check(value) || PyLong_Check(value) ||
@@ -816,6 +821,17 @@ static bool is_imm(PyObject *value)
   return false;
 }
 
+/**
+ * Gets the Python source code associated with an object. This will only work
+ * for objects defined in a Python file, i.e. not built-in or extension types or
+ * code written in an interpreter.
+ *
+ * This function is used to allow `when` blocks to be passed from one interpreter
+ * to another, and also for isolated types to be used on multiple interpreters without
+ * causing GIL issues. This is a workaround, ideally we would be able to use pointers
+ * from one interpreter another directly, but this is not possible due to race conditions
+ * on the ref counts of built-in functions and other similar issues.
+ */
 static PyObject *get_source(PyObject *obj)
 {
   PyObject *inspect = PyImport_ImportModule("inspect");
@@ -867,40 +883,78 @@ static PyObject *get_source(PyObject *obj)
 /*              Region struct and functions                    */
 /***************************************************************/
 
+/** Backing object for the `region` type. */
 typedef struct region_object_s
 {
   PyObject_HEAD;
+  // Human-readable name of the region. Does not have to be unique.
   PyObject *name;
+  // Alias to the region that this region is an alias to. In many
+  // cases this points back to the region itself, but can
+  // point to others if this region has been merged with another.
   PyObject *alias;
+  // Unique ID for the region.
   long long id;
+  // Whether the region is open or closed. Closed regions cannot
+  // be used to capture new objects.
   bool is_open;
+  // Whether the region is shared. Shared regions can be used by
+  // multiple interpreters via the `when` construct.
   bool is_shared;
+  // Parent region. If this is NULL, then the region is free.
   PyObject *parent;
+  // List of object graphs captured by this region. May include other
+  // regions.
   PyObject *objects;
+  // The last behavior scheduled on this region. This is used as part
+  // of the implementation of `when`.
   atomic_voidptr_t last;
 } RegionObject;
 
+/** Every captured object has a region tag associated with it. */
 typedef struct region_tag_object_s
 {
   PyObject_HEAD;
+  // The region that this object belongs to.
   RegionObject *region;
 } RegionTagObject;
 
+/** The state object for the veronapy module. */
 typedef struct vpy_state_s
 {
+  // A dictionary mapping types to their isolated versions. This is used
+  // to ensure that each type is isolated only once. If the type was isolated
+  // on another interpreter, it will be cached here after being loaded from the
+  // global table.
   PyObject *isolated_types;
+  // A dictionary mapping type IDs to a tuple of type object and source code
+  // string. When a type is isolated, this is populated. If the type was isolated
+  // on another interpreter, it will be cached here after being loaded from the
+  // global table.
   PyObject *frozen_types;
-  PyObject *imm_object_regions;
+  // A dictionary mapping object pointers to region tags. If an object was isolated
+  // on another interpreter, it will be cached here after being loaded from the
+  // global table.
+  PyObject *object_regions;
 } VPYState;
 
-static ht *global_imm_object_regions;
+// Hashtable mapping object pointers to region tags.
+static ht *global_object_regions;
+
+// Hashtable mapping type IDs to source code string pointers. This is used to
+// load frozen types from the global table into a new interpreter.
 static ht *global_frozen_types;
+
+// Monotonically increasing ID counter for frozen types.
 static atomic_llong frozen_type_count = 0;
 
 static thread_local PyObject *RegionIsolationError;
 static thread_local PyObject *WhenError;
 static thread_local VPYState *vpy_state;
 
+// As we will be intercepting various calls on the `region` type to check
+// for a valid `open` state, we keep a white-list of attributes that do
+// not require being open.
 static const char *REGION_ATTRS[] = {
     "name",
     "id",
@@ -918,10 +972,10 @@ static const char *REGION_ATTRS[] = {
     NULL,
 };
 
-// Whether the given region is free, i.e. has no parent
+/** Tests whether the region is free, i.e. has no parent. */
 static bool is_free(RegionObject *region) { return region->parent == NULL; }
 
-// Whether lhs is the root of a tree that contains rhs
+/** Whether lhs is the root of a tree that contains rhs */
 static bool owns(RegionObject *lhs, RegionObject *rhs)
 {
   if (lhs == rhs)
@@ -937,7 +991,7 @@ static bool owns(RegionObject *lhs, RegionObject *rhs)
   return owns(lhs, (RegionObject *)rhs->parent);
 }
 
-// This returns the true region, skipping past aliases.
+/** Resolves the true region, following aliases as necessary. */
 static RegionObject *resolve_region(RegionObject *start)
 {
   RegionObject *region = start;
@@ -954,6 +1008,10 @@ static RegionObject *resolve_region(RegionObject *start)
   return region;
 }
 
+/**
+ * When a type is frozen the type name is appened to the source code. This
+ * function retrieves it.
+ */
 static PyObject *get_type_name(PyObject *source)
 {
   PyObject *parts = PyUnicode_Splitlines(source, 0);
@@ -967,9 +1025,17 @@ static PyObject *get_type_name(PyObject *source)
   return last_line;
 }
 
+/**
+ * Each isolated type has an inner type which it uses to resolve attributes and
+ * methods once it verifies that the owning region is open. This function retrieves
+ * the type object for that inner type, potentially making a locking call to the
+ * global frozen types table.
+ */
 static PyTypeObject *get_type(PyTypeObject *isolated_type)
 {
   PyTypeObject *type;
+  // When the isolated type is created, the frozen type ID will be stored
+  // using an `__isolated__` attribute.
   PyObject *type_id_long = (PyObject *)PyDict_GetItemString(PyType_GetDict(isolated_type), "__isolated__");
   if (type_id_long == NULL)
   {
@@ -980,7 +1046,8 @@ static PyTypeObject *get_type(PyTypeObject *isolated_type)
 
   if (PyType_Check(type_id_long))
   {
-    // frozen type is a built-in or extension type
+    // frozen type is a built-in or extension type, and so the "type id" stored is
+    // just a pointer to the built-in, which already exists on the interpreter.
     type = (PyTypeObject *)type_id_long;
     return type;
   }
@@ -1005,8 +1072,11 @@ static PyTypeObject *get_type(PyTypeObject *isolated_type)
     return NULL;
   }
 
+  // We need to compile the source code into a type object.
   PyObject *ns = PyDict_New();
   PyRun_String(PyUnicode_AsUTF8(source), Py_file_input, ns, NULL);
+
+  // Now we can fetch it from the namespace (if it was compiled successfully)
   PyObject *type_name = get_type_name(source);
   type = (PyTypeObject *)PyDict_GetItem(ns, type_name);
   Py_DECREF(ns);
@@ -1039,17 +1109,22 @@ static PyTypeObject *get_type(PyTypeObject *isolated_type)
   return type;
 }
 
+/**
+ * Gets the region tag for the object. This function may make a blocking call to
+ * the global captured object hashtable.
+ */
 static RegionTagObject *get_tag(PyObject *value, bool with_errors)
 {
   PyObject *long_key = PyLong_FromVoidPtr(value);
-  RegionTagObject *region_tag = (RegionTagObject *)PyDict_GetItem(vpy_state->imm_object_regions, long_key);
+  RegionTagObject *region_tag = (RegionTagObject *)PyDict_GetItem(vpy_state->object_regions, long_key);
   if (region_tag != NULL)
   {
+    // we have already cached this (or it was captured on this interpreter)
     return region_tag;
   }
 
-  // this could be an immutable type from another interpreter, try the global table
-  region_tag = (RegionTagObject *)ht_get(global_imm_object_regions, (voidptr_t)value);
+  // this could be an object from another interpreter, try the global table
+  region_tag = (RegionTagObject *)ht_get(global_object_regions, (voidptr_t)value);
   if (region_tag == NULL)
   {
     if (with_errors)
@@ -1060,8 +1135,8 @@ static RegionTagObject *get_tag(PyObject *value, bool with_errors)
     return NULL;
   }
 
-  // let's cache this for later
-  int rc = PyDict_SetItem((PyObject *)vpy_state->imm_object_regions, long_key, (PyObject *)region_tag);
+  // cache this for later
+  int rc = PyDict_SetItem((PyObject *)vpy_state->object_regions, long_key, (PyObject *)region_tag);
   if (rc < 0)
   {
     if (with_errors)
@@ -1075,23 +1150,8 @@ static RegionTagObject *get_tag(PyObject *value, bool with_errors)
   return region_tag;
 }
 
-static RegionObject *get_region(PyObject *object)
-{
-  RegionTagObject *region_tag;
-  region_tag = get_tag(object, true);
-  if (region_tag == NULL)
-  {
-    PyErr_SetString(PyExc_TypeError,
-                    "error obtaining region of isolated object");
-    return NULL;
-  }
-
-  return region_tag->region;
-}
-
-// The region of an object (or an implicit region if the object is not
-// isolated)
-static RegionObject *region_of(PyObject *value)
+/** Returns the region of an object. */
+static RegionObject *get_region(PyObject *value)
 {
   RegionObject *region;
   RegionTagObject *tag = get_tag(value, false);
@@ -1112,7 +1172,7 @@ static RegionObject *region_of(PyObject *value)
 
 static int capture_object(RegionObject *region, PyObject *value);
 
-// Attempts to capture all the items in a sequence into the given region
+/** Attempts to capture all the items in a sequence into the given region */
 static int capture_sequence(RegionObject *region, PyObject *sequence)
 {
   PyObject *iterator = PyObject_GetIter(sequence);
@@ -1156,7 +1216,7 @@ static int capture_sequence(RegionObject *region, PyObject *sequence)
   return 0;
 }
 
-// Attempts to capture all the values in a mapping into the given region
+/** Attempts to capture all the values in a mapping into the given region */
 static int capture_mapping(RegionObject *region, PyObject *mapping)
 {
   PyObject *values = PyMapping_Values(mapping);
@@ -1174,18 +1234,22 @@ static int capture_mapping(RegionObject *region, PyObject *mapping)
 static PyTypeObject RegionTagType;
 static PyTypeObject *isolate_type(PyTypeObject *type);
 
-// Attempts to capture an object into the given region.
-// This function will find all the types of all the objects
-// in the graph for which value is the root and capture them into the
-// region. If they have already been captured, it will use the type it
-// previously captured.
+/**
+ * Attempts to capture an object into the given region.
+ * This function will find all the types of all the objects
+ * in the graph for which value is the root and capture them into the
+ * region. If they have already been captured, it will use the type it
+ * previously captured.
+ *
+ * This makes a blocking call to the global hashtable of captured objects.
+ */
 static int capture_object(RegionObject *region, PyObject *value)
 {
   PyObject *tag;
   PyTypeObject *isolated_type;
   int rc = 0;
   PyTypeObject *type = Py_TYPE(value);
-  RegionObject *value_region = region_of(value);
+  RegionObject *value_region = get_region(value);
 
   if (is_imm(value) || value_region == region)
   {
@@ -1264,8 +1328,10 @@ static int capture_object(RegionObject *region, PyObject *value)
 
   isolated_type =
       (PyTypeObject *)PyDict_GetItem(vpy_state->isolated_types, (PyObject *)type);
+
   if (isolated_type == NULL)
   {
+    // first time we've seen this type on this interpreter, isolate it
     isolated_type = isolate_type(type);
     if (isolated_type == NULL)
     {
@@ -1296,7 +1362,9 @@ static int capture_object(RegionObject *region, PyObject *value)
     Py_DECREF(tag);
     return -1;
   }
-  rc = PyDict_SetItem(vpy_state->imm_object_regions, long_key, tag);
+
+  // store in the interpreter cache
+  rc = PyDict_SetItem(vpy_state->object_regions, long_key, tag);
   if (rc < 0)
   {
     PyErr_SetString(RegionIsolationError, "Unable to set region tag");
@@ -1304,7 +1372,8 @@ static int capture_object(RegionObject *region, PyObject *value)
     return -1;
   }
 
-  if (!ht_set(global_imm_object_regions, (voidptr_t)value, (voidptr_t)tag))
+  // blocking call to global table
+  if (!ht_set(global_object_regions, (voidptr_t)value, (voidptr_t)tag))
   {
     PyErr_SetString(RegionIsolationError, "Unable to set region tag in global object table");
     Py_DECREF(tag);
@@ -1323,30 +1392,47 @@ static bool Region_Check(PyObject *obj);
 /*                   Behavior Implementation                   */
 /***************************************************************/
 
+/** Singleton used to signal when the system can be shut down. */
 typedef struct terminator_s
 {
+  // Number of active behaviors in flight.
   atomic_llong count;
+  // Set when the system can be shut down.
   atomic_bool set;
 } Terminator;
 
 typedef struct behavior_s Behavior;
 
+/** A request to capture a region. */
 typedef struct request_s
 {
+  // The next Behavior that needs the region
   volatile Behavior *next;
+  // Whether the request has been scheduled
   volatile bool scheduled;
+  // The region to capture
   RegionObject *target;
 } Request;
 
+/**
+ * A callable bit of code that depends on capturing one or more
+ * and can run on any interpreter.
+ */
 typedef struct behavior_s
 {
+  // The source code for the callable thunk
   PyObject *thunk_source;
+  // Pointers to the local variables captured by the thunk
   PyObject *thunk_locals;
+  // Counter used to indicate when the behavior is ready to run
   atomic_llong count;
+  // The number of requests
   Py_ssize_t length;
+  // An array of requests
   Request *requests;
 } Behavior;
 
+/** A node in a linked list of behaviors. */
 typedef struct node_s
 {
   Behavior *behavior;
@@ -1354,6 +1440,10 @@ typedef struct node_s
   struct node_s *prev;
 } Node;
 
+/**
+ * A thread-safe queue of behaviors. Will eventually be replaced with a lockless
+ * data structure.
+ */
 typedef struct pcqueue_s
 {
   Node *front;
@@ -1363,32 +1453,50 @@ typedef struct pcqueue_s
   bool active;
 } PCQueue;
 
+/** The when decorator. */
 typedef struct when_object_s
 {
   PyObject_HEAD;
+  // the regions needed by the behavior
   PyObject *regions;
 } WhenObject;
 
+/** Stores information when an exception is thrown in a behavior. */
 typedef struct behavior_exception_s
 {
+  // The interpreter that the exception was thrown on
   PyInterpreterState *interp;
+  // The name of the exception type
   char *name;
+  // The exception message
   char *msg;
+  // The next exception in the linked list
   struct behavior_exception_s *next;
 } BehaviorException;
 
+// Atomic pointer to the front of the exception list.
 static atomic_voidptr_t behavior_exceptions = (voidptr_t)NULL;
-static atomic_llong region_identity = 0;
-static atomic_bool running = false;
-static Terminator *terminator;
-static PCQueue *work_queue;
-static Py_ssize_t worker_count = 1;
-static thrd_t *workers;
-static PyThreadState **subinterpreters;
 
-// NB Unless otherwise specified, none of the Behavior-related functions
-// require holding the GIL. Since they are being used from multiple different
-// threads this makes many things easier, especially memory management.
+// Monitonically increasing ID for regions
+static atomic_llong region_identity = 0;
+
+// Whether the system is running
+static atomic_bool running = false;
+
+// The singleton instance of the terminator
+static Terminator *terminator;
+
+// The queue of behaviors that need to be scheduled
+static PCQueue *work_queue;
+
+// The number of workers (set later based on the number of processors or VPY_WORKER_COUNT)
+static Py_ssize_t worker_count = 1;
+
+// Array of worker threads
+static thrd_t *workers;
+
+// Array of subinterpreters
+static PyThreadState **subinterpreters;
 
 static void BehaviorException_new(PyObject *type, PyObject *value, PyObject *traceback)
 {
@@ -3645,7 +3753,7 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
     return -1;
   }
 
-  RegionObject *value_region = region_of(value);
+  RegionObject *value_region = get_region(value);
   if (value_region == NULL)
   {
     rc = capture_object(region, value);
@@ -3832,8 +3940,8 @@ static int VPY_run()
     return 0;
   }
 
-  global_imm_object_regions = ht_create(128, true);
-  if (global_imm_object_regions == NULL)
+  global_object_regions = ht_create(128, true);
+  if (global_object_regions == NULL)
   {
     return -1;
   }
@@ -3918,7 +4026,7 @@ static int VPY_wait()
 
   free_subinterpreters();
 
-  ht_free(global_imm_object_regions);
+  ht_free(global_object_regions);
 
   return 0;
 }
@@ -4039,8 +4147,8 @@ static int veronapy_exec(PyObject *module)
     return -1;
   }
 
-  vpy_state->imm_object_regions = PyDict_New();
-  if (vpy_state->imm_object_regions == NULL)
+  vpy_state->object_regions = PyDict_New();
+  if (vpy_state->object_regions == NULL)
   {
     return -1;
   }
@@ -4065,7 +4173,7 @@ void veronapy_free(PyObject *module)
   if (state != NULL)
   {
     Py_XDECREF(state->isolated_types);
-    Py_XDECREF(state->imm_object_regions);
+    Py_XDECREF(state->object_regions);
   }
 }
 
