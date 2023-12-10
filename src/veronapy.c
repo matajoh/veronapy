@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/***************************************************************/
+/*    Platform-specific Threading Aliases/Wrappers             */
+/***************************************************************/
+
 #ifdef _WIN32
 #include <windows.h>
 typedef volatile long long atomic_llong;
@@ -494,75 +498,6 @@ static bool ht_set(ht *table, voidptr_t key, voidptr_t value)
   return result;
 }
 
-#if 0
-/***************************************************************/
-/*                  Linked-List Implementation                 */
-/***************************************************************/
-
-typedef struct list_node_s
-{
-  voidptr_t value;
-  struct list_node_s *next;
-} list_node;
-
-typedef struct list_s
-{
-  list_node *head;
-  list_node *tail;
-  Py_ssize_t length;
-} list;
-
-static list *list_create()
-{
-  list *l = (list *)malloc(sizeof(list));
-  if (l == NULL)
-  {
-    return NULL;
-  }
-
-  l->head = NULL;
-  l->tail = NULL;
-  l->length = 0;
-  return l;
-}
-
-static void list_free(list *l)
-{
-  list_node *node = l->head;
-  while (node != NULL)
-  {
-    list_node *next = node->next;
-    free(node);
-    node = next;
-  }
-
-  free(l);
-}
-
-static void list_append(list *l, voidptr_t value)
-{
-  list_node *node = (list_node *)malloc(sizeof(list_node));
-  if (node == NULL)
-  {
-    return;
-  }
-
-  node->value = value;
-  node->next = NULL;
-  if (l->head == NULL)
-  {
-    l->head = l->tail = node;
-  }
-  else
-  {
-    l->tail->next = node;
-    l->tail = node;
-  }
-
-  l->length++;
-}
-#endif
-
 /***************************************************************/
 /*                     Macros and Defines                      */
 /***************************************************************/
@@ -582,42 +517,30 @@ char VPY_DEBUG_FMT_BUF[1024];
 #define PRINTDBG(...)
 #endif
 
-#define _VPY_GETTYPE(n, i, r)                                            \
-  n = get_type(i);                                                       \
-  if (n == NULL)                                                         \
+#define VPY_CHECKTYPE(type, ret)                                         \
+  if (type == NULL)                                                      \
   {                                                                      \
     PyErr_SetString(PyExc_TypeError,                                     \
-                    "error obtaining internal type of isolated object"); \
-    return r;                                                            \
+                    "Unable to extract frozen type from isolated type"); \
+    return ret;                                                          \
   }
 
-#define VPY_GETTYPE(r) \
-  PyTypeObject *type;  \
-  _VPY_GETTYPE(type, isolated_type, r)
+#define VPY_CHECKREGION(region, ret)                                  \
+  if (region == NULL)                                                 \
+  {                                                                   \
+    PyErr_SetString(PyExc_TypeError,                                  \
+                    "Unable to extract region from isolated object"); \
+    return ret;                                                       \
+  }
 
-#define _VPY_GETREGION(n, r)                                      \
-  RegionTagObject *region_tag;                                    \
-  region_tag = get_tag(self, true);                               \
-  if (region_tag == NULL)                                         \
-  {                                                               \
-    PyErr_SetString(PyExc_TypeError,                              \
-                    "error obtaining region of isolated object"); \
-    return r;                                                     \
-  }                                                               \
-  n = region_tag->region;
-
-#define VPY_GETREGION(r) \
-  RegionObject *region;  \
-  _VPY_GETREGION(region, r)
-
-#define VPY_CHECKREGIONOPEN(r)                                   \
+#define VPY_CHECKREGIONOPEN(region, ret)                         \
   if (!region->is_open)                                          \
   {                                                              \
     PyErr_SetString(RegionIsolationError, "Region is not open"); \
-    return r;                                                    \
+    return ret;                                                  \
   }
 
-#define VPY_CHECKARG0REGION(r)                                   \
+#define VPY_CHECKARG0REGION(ret)                                 \
   PyTypeObject *arg0_type = Py_TYPE(arg0);                       \
   PyTypeObject *arg0_isolated_type = arg0_type;                  \
   RegionObject *arg0_region = region_of(arg0);                   \
@@ -630,16 +553,17 @@ char VPY_DEBUG_FMT_BUF[1024];
   }                                                              \
   else if (arg0_region == region)                                \
   {                                                              \
-    _VPY_GETTYPE(arg0_type, arg0_isolated_type, r);              \
+    arg0_type = get_type(arg0_isolated_type);                    \
+    VPY_CHECKTYPE(arg0_type, ret)                                \
   }                                                              \
   else                                                           \
   {                                                              \
     PyErr_SetString(RegionIsolationError,                        \
                     "First argument belongs to another region"); \
-    return r;                                                    \
+    return ret;                                                  \
   }
 
-#define VPY_CHECKARG1REGION(r)                                    \
+#define VPY_CHECKARG1REGION(ret)                                  \
   PyTypeObject *arg1_type = Py_TYPE(arg1);                        \
   PyTypeObject *arg1_isolated_type = arg1_type;                   \
   RegionObject *arg1_region = region_of(arg1);                    \
@@ -652,48 +576,55 @@ char VPY_DEBUG_FMT_BUF[1024];
   }                                                               \
   else if (arg1_region == region)                                 \
   {                                                               \
-    _VPY_GETTYPE(arg1_type, arg1_isolated_type, r);               \
+    arg1_type = get_type(arg1_isolated_type);                     \
+    VPY_CHECKTYPE(arg1_type, ret)                                 \
   }                                                               \
   else                                                            \
   {                                                               \
     PyErr_SetString(RegionIsolationError,                         \
                     "Second argument belongs to another region"); \
-    return r;                                                     \
+    return ret;                                                   \
   }
 
 #define VPY_LENFUNC(interface, name)                 \
   Py_ssize_t Isolated_##name(PyObject *self)         \
   {                                                  \
     PyTypeObject *isolated_type = Py_TYPE(self);     \
-    VPY_GETTYPE(0);                                  \
-    VPY_GETREGION(0);                                \
-    VPY_CHECKREGIONOPEN(0);                          \
+    PyTypeObject *type = get_type(isolated_type);    \
+    VPY_CHECKTYPE(type, 0)                           \
+    RegionObject *region = get_region(self);         \
+    VPY_CHECKREGION(region, 0)                       \
+    VPY_CHECKREGIONOPEN(region, 0);                  \
     self->ob_type = type;                            \
     Py_ssize_t length = type->interface->name(self); \
     self->ob_type = isolated_type;                   \
     return length;                                   \
   }
 
-#define VPY_INQUIRY(interface, name)             \
-  int Isolated_##name(PyObject *self)            \
-  {                                              \
-    PyTypeObject *isolated_type = Py_TYPE(self); \
-    VPY_GETTYPE(0);                              \
-    VPY_GETREGION(0);                            \
-    VPY_CHECKREGIONOPEN(0);                      \
-    self->ob_type = type;                        \
-    int result = type->interface->name(self);    \
-    self->ob_type = isolated_type;               \
-    return result;                               \
+#define VPY_INQUIRY(interface, name)              \
+  int Isolated_##name(PyObject *self)             \
+  {                                               \
+    PyTypeObject *isolated_type = Py_TYPE(self);  \
+    PyTypeObject *type = get_type(isolated_type); \
+    VPY_CHECKTYPE(type, 0)                        \
+    RegionObject *region = get_region(self);      \
+    VPY_CHECKREGION(region, 0)                    \
+    VPY_CHECKREGIONOPEN(region, 0);               \
+    self->ob_type = type;                         \
+    int result = type->interface->name(self);     \
+    self->ob_type = isolated_type;                \
+    return result;                                \
   }
 
 #define VPY_UNARYFUNC(interface, name)              \
   PyObject *Isolated_##name(PyObject *self)         \
   {                                                 \
     PyTypeObject *isolated_type = Py_TYPE(self);    \
-    VPY_GETTYPE(NULL);                              \
-    VPY_GETREGION(NULL);                            \
-    VPY_CHECKREGIONOPEN(NULL);                      \
+    PyTypeObject *type = get_type(isolated_type);   \
+    VPY_CHECKTYPE(type, NULL)                       \
+    RegionObject *region = get_region(self);        \
+    VPY_CHECKREGION(region, NULL)                   \
+    VPY_CHECKREGIONOPEN(region, NULL);              \
     self->ob_type = type;                           \
     PyObject *result = type->interface->name(self); \
     self->ob_type = isolated_type;                  \
@@ -704,9 +635,11 @@ char VPY_DEBUG_FMT_BUF[1024];
   PyObject *Isolated_##name(PyObject *self, PyObject *arg0) \
   {                                                         \
     PyTypeObject *isolated_type = Py_TYPE(self);            \
-    VPY_GETTYPE(NULL);                                      \
-    VPY_GETREGION(NULL);                                    \
-    VPY_CHECKREGIONOPEN(NULL);                              \
+    PyTypeObject *type = get_type(isolated_type);           \
+    VPY_CHECKTYPE(type, NULL)                               \
+    RegionObject *region = get_region(self);                \
+    VPY_CHECKREGION(region, NULL)                           \
+    VPY_CHECKREGIONOPEN(region, NULL);                      \
     if (arg0 != NULL)                                       \
     {                                                       \
       VPY_CHECKARG0REGION(NULL);                            \
@@ -721,9 +654,11 @@ char VPY_DEBUG_FMT_BUF[1024];
   PyObject *Isolated_##name(PyObject *self, PyObject *arg0, PyObject *arg1) \
   {                                                                         \
     PyTypeObject *isolated_type = Py_TYPE(self);                            \
-    VPY_GETTYPE(NULL);                                                      \
-    VPY_GETREGION(NULL);                                                    \
-    VPY_CHECKREGIONOPEN(NULL);                                              \
+    PyTypeObject *type = get_type(isolated_type);                           \
+    VPY_CHECKTYPE(type, NULL)                                               \
+    RegionObject *region = get_region(self);                                \
+    VPY_CHECKREGION(region, NULL)                                           \
+    VPY_CHECKREGIONOPEN(region, NULL);                                      \
     if (arg0 != NULL)                                                       \
     {                                                                       \
       VPY_CHECKARG0REGION(NULL);                                            \
@@ -743,9 +678,11 @@ char VPY_DEBUG_FMT_BUF[1024];
   {                                                                   \
     PyTypeObject *isolated_type = Py_TYPE(self);                      \
     int rc;                                                           \
-    VPY_GETTYPE(-1);                                                  \
-    VPY_GETREGION(-1);                                                \
-    VPY_CHECKREGIONOPEN(-1);                                          \
+    PyTypeObject *type = get_type(isolated_type);                     \
+    VPY_CHECKTYPE(type, -1)                                           \
+    RegionObject *region = get_region(self);                          \
+    VPY_CHECKREGION(region, -1)                                       \
+    VPY_CHECKREGIONOPEN(region, -1);                                  \
     VPY_CHECKARG0REGION(-1);                                          \
     if (arg1 != NULL)                                                 \
     {                                                                 \
@@ -761,9 +698,11 @@ char VPY_DEBUG_FMT_BUF[1024];
   PyObject *Isolated_##name(PyObject *self, Py_ssize_t arg) \
   {                                                         \
     PyTypeObject *isolated_type = Py_TYPE(self);            \
-    VPY_GETTYPE(NULL);                                      \
-    VPY_GETREGION(NULL);                                    \
-    VPY_CHECKREGIONOPEN(NULL);                              \
+    PyTypeObject *type = get_type(isolated_type);           \
+    VPY_CHECKTYPE(type, NULL)                               \
+    RegionObject *region = get_region(self);                \
+    VPY_CHECKREGION(region, NULL)                           \
+    VPY_CHECKREGIONOPEN(region, NULL);                      \
     self->ob_type = type;                                   \
     PyObject *result = type->interface->name(self, arg);    \
     self->ob_type = isolated_type;                          \
@@ -775,9 +714,11 @@ char VPY_DEBUG_FMT_BUF[1024];
   {                                                                    \
     PyTypeObject *isolated_type = Py_TYPE(self);                       \
     int rc;                                                            \
-    VPY_GETTYPE(-1);                                                   \
-    VPY_GETREGION(-1);                                                 \
-    VPY_CHECKREGIONOPEN(-1);                                           \
+    PyTypeObject *type = get_type(isolated_type);                      \
+    VPY_CHECKTYPE(type, -1)                                            \
+    RegionObject *region = get_region(self);                           \
+    VPY_CHECKREGION(region, -1)                                        \
+    VPY_CHECKREGIONOPEN(region, -1);                                   \
     if (arg1 != NULL)                                                  \
     {                                                                  \
       VPY_CHECKARG1REGION(-1);                                         \
@@ -793,9 +734,11 @@ char VPY_DEBUG_FMT_BUF[1024];
   {                                                   \
     PyTypeObject *isolated_type = Py_TYPE(self);      \
     int rc;                                           \
-    VPY_GETTYPE(-1);                                  \
-    VPY_GETREGION(-1);                                \
-    VPY_CHECKREGIONOPEN(-1);                          \
+    PyTypeObject *type = get_type(isolated_type);     \
+    VPY_CHECKTYPE(type, -1)                           \
+    RegionObject *region = get_region(self);          \
+    VPY_CHECKREGION(region, -1)                       \
+    VPY_CHECKREGIONOPEN(region, -1);                  \
     if (arg0 != NULL)                                 \
     {                                                 \
       VPY_CHECKARG0REGION(-1);                        \
@@ -804,13 +747,6 @@ char VPY_DEBUG_FMT_BUF[1024];
     rc = type->interface->name(self, arg0);           \
     self->ob_type = isolated_type;                    \
     return rc;                                        \
-  }
-
-#define VPY_REGION(x)                   \
-  RegionObject *region = (x);           \
-  if (region->alias != (PyObject *)(x)) \
-  {                                     \
-    region = resolve_region(region);    \
   }
 
 #define VPY_ERROR(x) printf("veronapy Error: %s\n", x);
@@ -920,7 +856,7 @@ static PyObject *get_source(PyObject *obj)
   source = PyObject_CallOneArg(dedent, source);
   if (source == NULL)
   {
-    PyErr_SetString(PyExc_RuntimeError, "Unable to dedent thunk source");
+    PyErr_SetString(PyExc_RuntimeError, "Unable to dedent object source");
     return NULL;
   }
 
@@ -1137,6 +1073,20 @@ static RegionTagObject *get_tag(PyObject *value, bool with_errors)
   }
 
   return region_tag;
+}
+
+static RegionObject *get_region(PyObject *object)
+{
+  RegionTagObject *region_tag;
+  region_tag = get_tag(object, true);
+  if (region_tag == NULL)
+  {
+    PyErr_SetString(PyExc_TypeError,
+                    "error obtaining region of isolated object");
+    return NULL;
+  }
+
+  return region_tag->region;
 }
 
 // The region of an object (or an implicit region if the object is not
@@ -2035,7 +1985,7 @@ static thrd_return_t worker(void *arg)
 
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
-      VPY_REGION(r->target);
+      RegionObject *region = resolve_region(r->target);
       PRINTDBG("opening region %s\n", PyUnicode_AsUTF8(region->name));
       region->is_open = true;
       Py_INCREF(region);
@@ -2069,7 +2019,7 @@ static thrd_return_t worker(void *arg)
     PRINTDBG("releasing requests\n");
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
-      VPY_REGION(r->target);
+      RegionObject *region = resolve_region(r->target);
       PRINTDBG("closing region %s\n", PyUnicode_AsUTF8(region->name));
       region->is_open = false;
       ts = PyEval_SaveThread();
@@ -2574,9 +2524,11 @@ static PyObject *Isolated_repr(PyObject *self)
 {
   PyObject *repr;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, NULL);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, NULL);
+  VPY_CHECKREGIONOPEN(region, NULL);
 
   self->ob_type = type;
   repr = type->tp_repr(self);
@@ -2588,9 +2540,11 @@ static PyObject *Isolated_str(PyObject *self)
 {
   PyObject *str;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, NULL);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, NULL);
+  VPY_CHECKREGIONOPEN(region, NULL);
 
   self->ob_type = type;
   str = type->tp_str(self);
@@ -2602,9 +2556,11 @@ static PyObject *Isolated_richcompare(PyObject *self, PyObject *other, int op)
 {
   PyObject *result;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, NULL);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, NULL);
+  VPY_CHECKREGIONOPEN(region, NULL);
 
   PRINTDBG("Isolated_richcompare %s\n", PyUnicode_AsUTF8(region->name));
 
@@ -2618,9 +2574,11 @@ static PyObject *Isolated_iter(PyObject *self)
 {
   PyObject *iter;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, NULL);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, NULL);
+  VPY_CHECKREGIONOPEN(region, NULL);
 
   self->ob_type = type;
   iter = type->tp_iter(self);
@@ -2632,9 +2590,11 @@ static PyObject *Isolated_iternext(PyObject *self)
 {
   PyObject *next;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
-  VPY_GETREGION(NULL);
-  VPY_CHECKREGIONOPEN(NULL);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, NULL);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, NULL);
+  VPY_CHECKREGIONOPEN(region, NULL);
 
   self->ob_type = type;
   next = type->tp_iternext(self);
@@ -2646,9 +2606,11 @@ static Py_hash_t Isolated_hash(PyObject *self)
 {
   Py_hash_t hash;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(0);
-  VPY_GETREGION(0);
-  VPY_CHECKREGIONOPEN(0);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, 0);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, 0);
+  VPY_CHECKREGIONOPEN(region, 0);
 
   self->ob_type = type;
   hash = type->tp_hash(self);
@@ -2656,37 +2618,12 @@ static Py_hash_t Isolated_hash(PyObject *self)
   return hash;
 }
 
-/* static int Isolated_traverse(PyObject *self, visitproc visit, void *arg)
-{
-  int rc;
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-
-  self->ob_type = type;
-  rc = type->tp_traverse(self, visit, arg);
-  self->ob_type = isolated_type;
-  return rc;
-}
-
-static int Isolated_clear(PyObject *self)
-{
-  int rc;
-
-  PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-
-  self->ob_type = type;
-  rc = type->tp_clear(self);
-  self->ob_type = isolated_type;
-
-  return rc;
-} */
-
 static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
 {
   PyObject *result;
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(NULL);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, NULL);
 
   if (PyObject_HasAttr((PyObject *)isolated_type, attr_name))
   {
@@ -2694,7 +2631,9 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
   }
 
   self->ob_type = type;
-  VPY_GETREGION(NULL);
+  RegionTagObject *region_tag = get_tag(self, true);
+  VPY_CHECKREGION(region_tag, NULL);
+  RegionObject *region = region_tag->region;
 
   if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
   {
@@ -2720,8 +2659,10 @@ static int Isolated_setattro(PyObject *self, PyObject *attr_name,
   int rc;
 
   PyTypeObject *isolated_type = Py_TYPE(self);
-  VPY_GETTYPE(-1);
-  VPY_GETREGION(-1);
+  PyTypeObject *type = get_type(isolated_type);
+  VPY_CHECKTYPE(type, -1);
+  RegionObject *region = get_region(self);
+  VPY_CHECKREGION(region, -1);
 
   if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
   {
@@ -3436,14 +3377,14 @@ static int Region_init(RegionObject *self, PyObject *args, PyObject *kwds)
 
 static PyObject *Region_getname(RegionObject *self, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   Py_INCREF(region->name);
   return region->name;
 }
 
 static int Region_setname(RegionObject *self, PyObject *value, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   PyObject *tmp;
   if (value == NULL)
   {
@@ -3467,32 +3408,32 @@ static int Region_setname(RegionObject *self, PyObject *value, void *closure)
 
 static PyObject *Region_getidentity(RegionObject *self, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return PyLong_FromUnsignedLongLong(region->id);
 }
 
 static PyObject *Region_getparent(RegionObject *self, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   Py_INCREF(region->parent);
   return region->parent;
 }
 
 static PyObject *Region_getisopen(RegionObject *self, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return PyBool_FromLong(region->is_open);
 }
 
 static PyObject *Region_getisshared(RegionObject *self, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return PyBool_FromLong(region->is_shared);
 }
 
 static PyObject *Region_getisfree(RegionObject *self, void *closure)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return PyBool_FromLong(is_free(region));
 }
 
@@ -3516,7 +3457,7 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 {
   PyObject *arg;
   RegionObject *other;
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
 
   if (!PyArg_ParseTuple(args, "O", &arg))
     return NULL;
@@ -3557,7 +3498,7 @@ static PyObject *Region_merge(RegionObject *self, PyObject *args,
 
 static PyObject *Region_makeshareable(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
 
   region->is_shared = true;
   region->last = 0;
@@ -3569,7 +3510,7 @@ static PyObject *Region_detachall(RegionObject *self, PyObject *args)
 {
   PyObject *objects;
   RegionObject *detached;
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
 
   if (!region->is_open)
   {
@@ -3599,13 +3540,13 @@ static PyObject *Region_detachall(RegionObject *self, PyObject *args)
 
 static PyObject *Region_str(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return PyUnicode_FromFormat("Region(%S)", region->name);
 }
 
 static PyObject *Region_repr(RegionObject *self, PyObject *Py_UNUSED(ignored))
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return PyUnicode_FromFormat("Region(%S%s%s)", region->name,
                               region->id, region->is_open ? " open" : "",
                               region->is_shared ? " shared" : "");
@@ -3614,7 +3555,7 @@ static PyObject *Region_repr(RegionObject *self, PyObject *Py_UNUSED(ignored))
 static PyObject *Region_enter(RegionObject *self,
                               PyObject *Py_UNUSED(ignored))
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   region->is_open = true;
   Py_INCREF((PyObject *)region);
   return (PyObject *)region;
@@ -3623,7 +3564,7 @@ static PyObject *Region_enter(RegionObject *self,
 static PyObject *Region_exit(RegionObject *self, PyObject *args,
                              PyObject *kwds)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   PyObject *type, *value, *traceback;
   if (!PyArg_ParseTuple(args, "OOO", &type, &value, &traceback))
     return NULL;
@@ -3660,7 +3601,7 @@ static PyMethodDef Region_methods[] = {
 
 static PyObject *Region_getattro(RegionObject *self, PyObject *attr_name)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   for (int i = 0; REGION_ATTRS[i] != NULL; i++)
   {
     if (strcmp(PyUnicode_AsUTF8(attr_name), REGION_ATTRS[i]) == 0)
@@ -3689,7 +3630,7 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
                            PyObject *value)
 {
   int rc;
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   for (int i = 0; REGION_ATTRS[i] != NULL; i++)
   {
     if (strcmp(PyUnicode_AsUTF8(attr_name), REGION_ATTRS[i]) == 0)
@@ -3729,7 +3670,7 @@ static int Region_setattro(RegionObject *self, PyObject *attr_name,
 
 static Py_hash_t Region_hash(RegionObject *self)
 {
-  VPY_REGION(self);
+  RegionObject *region = resolve_region(self);
   return (Py_hash_t)region->id;
 }
 
@@ -3820,13 +3761,13 @@ static int RegionTag_init(RegionTagObject *self, PyObject *args, PyObject *kwds)
 
 static PyObject *RegionTag_str(RegionTagObject *self, PyObject *Py_UNUSED(ignored))
 {
-  VPY_REGION(self->region);
+  RegionObject *region = resolve_region(self);
   return PyUnicode_FromFormat("RegionTag(%S)", region->name, region->id);
 }
 
 static PyObject *RegionTag_repr(RegionTagObject *self, PyObject *Py_UNUSED(ignored))
 {
-  VPY_REGION(self->region);
+  RegionObject *region = resolve_region(self);
   return PyUnicode_FromFormat("RegionTag(%S%s%s)", region->name,
                               region->id, region->is_open ? " open" : "",
                               region->is_shared ? " shared" : "");
