@@ -17,6 +17,9 @@ class Item:
     def __lt__(self, other):
         return self.value < other.value
 
+    def __le__(self, other):
+        return self.value <= other.value
+
     def __repr__(self):
         return str(self.value)
 

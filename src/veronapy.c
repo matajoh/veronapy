@@ -573,7 +573,7 @@ static void list_append(list *l, voidptr_t value)
 #define VPY_MULTIGIL
 #endif
 
-#define VPY_DEBUG
+// #define VPY_DEBUG
 
 #ifdef VPY_DEBUG
 char VPY_DEBUG_FMT_BUF[1024];
@@ -1018,10 +1018,21 @@ static RegionObject *resolve_region(RegionObject *start)
   return region;
 }
 
+static PyObject *get_type_name(PyObject *source)
+{
+  PyObject *parts = PyUnicode_Splitlines(source, 0);
+  if (parts == NULL)
+  {
+    PyErr_SetString(PyExc_RuntimeError, "Unable to split source into lines");
+    return NULL;
+  }
+
+  PyObject *last_line = PySequence_GetItem(parts, PySequence_Length(parts) - 1);
+  return last_line;
+}
+
 static PyTypeObject *get_type(PyTypeObject *isolated_type)
 {
-  printf("get_type?\n");
-  PRINTDBG("get_type %p\n", isolated_type);
   PyTypeObject *type;
   PyObject *type_id_long = (PyObject *)PyDict_GetItemString(PyType_GetDict(isolated_type), "__isolated__");
   if (type_id_long == NULL)
@@ -1033,21 +1044,21 @@ static PyTypeObject *get_type(PyTypeObject *isolated_type)
 
   if (PyType_Check(type_id_long))
   {
+    // frozen type is a built-in or extension type
     type = (PyTypeObject *)type_id_long;
-    PRINTDBG("get_type frozen type is a built-in or extension type %s\n", type->tp_name);
     return type;
   }
 
   PyObject *type_tuple = PyDict_GetItem(vpy_state->frozen_types, type_id_long);
   if (type_tuple != NULL)
   {
+    // frozen type is already cached on this interpreter
     type = (PyTypeObject *)PyTuple_GET_ITEM(type_tuple, 0);
-    PRINTDBG("type was cached on the interpreter %s\n", type->tp_name);
     return type;
   }
 
   long long type_id = PyLong_AsLongLong(type_id_long);
-  PRINTDBG("Need to load type %li from global table and compile on this interpreter", type_id);
+  PRINTDBG("get_type: need to load type %li from global table and compile on this interpreter\n", type_id);
 
   // need to load this type into the interpreter
   PyObject *source = (PyObject *)ht_get(global_frozen_types, (voidptr_t)type_id);
@@ -1059,8 +1070,11 @@ static PyTypeObject *get_type(PyTypeObject *isolated_type)
   }
 
   PyObject *ns = PyDict_New();
-  type = (PyTypeObject *)PyRun_String(PyUnicode_AsUTF8(source), Py_file_input, ns, NULL);
+  PyRun_String(PyUnicode_AsUTF8(source), Py_file_input, ns, NULL);
+  PyObject *type_name = get_type_name(source);
+  type = (PyTypeObject *)PyDict_GetItem(ns, type_name);
   Py_DECREF(ns);
+
   if (type == NULL)
   {
     PyErr_SetString(PyExc_TypeError,
@@ -3202,6 +3216,11 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
     }
 
     return isolated_type;
+  }
+  else
+  {
+    source = PyUnicode_Concat(source, PyUnicode_FromString("\n"));
+    source = PyUnicode_Concat(source, PyUnicode_FromString(type->tp_name));
   }
 
   long long type_id = atomic_increment(&frozen_type_count);
