@@ -1883,7 +1883,7 @@ static Behavior *Behavior_new(PyObject *thunk_source, PyObject *thunk_locals, Py
   b->requests = (Request *)malloc(sizeof(Request) * b->length);
   if (b->requests == NULL)
   {
-    PyMem_FREE(b);
+    free(b);
     PyErr_SetString(PyExc_RuntimeError, "Unable to allocate requests");
     return NULL;
   }
@@ -1893,7 +1893,7 @@ static Behavior *Behavior_new(PyObject *thunk_source, PyObject *thunk_locals, Py
     PyObject *region = PyList_GetItem(regions, i);
     if (region == NULL)
     {
-      PyMem_FREE(b);
+      free(b);
       PyErr_SetString(PyExc_RuntimeError, "Unable to get region from list");
       return NULL;
     }
@@ -2026,6 +2026,9 @@ static void Request_finish_enqueue(Request *self)
   self->scheduled = true;
 }
 
+/** The main loop of an interpreter. Will draw work off of the queue to
+ *  perform until the system enters shutdown.
+ */
 static thrd_return_t worker(void *arg)
 {
   int rc;
@@ -2041,12 +2044,9 @@ static thrd_return_t worker(void *arg)
   index = (Py_ssize_t)arg;
   ts = subinterpreters[index];
   alloc_id = index + 1;
-#ifdef VPY_MULTIGIL
   PyEval_AcquireThread(ts);
-#else
-  PyEval_AcquireThread(ts);
-#endif
 
+  // each process has its own copy of the veronapy module
   veronapy = PyImport_ImportModule("veronapy");
   if (veronapy == NULL)
   {
@@ -2177,6 +2177,11 @@ end:
   return (thrd_return_t)0;
 }
 
+/**
+ * Sets the worker count. This will either be pulled from an environment variable
+ * or based upon the number of processors on the system (obtained using
+ * either sched_getaffinity or cpu_count).
+ */
 static int set_worker_count()
 {
   PyObject *os_module, *os_dict, *function, *result, *key;
@@ -2389,11 +2394,11 @@ static int shutdown_workers()
   for (Py_ssize_t i = 0; i < worker_count; ++i)
   {
     PRINTDBG("joining worker thread %li\n", i);
-    Py_BEGIN_ALLOW_THREADS
-        rc = thrd_join(workers[i], NULL);
-    Py_END_ALLOW_THREADS
+    Py_BEGIN_ALLOW_THREADS;
+    rc = thrd_join(workers[i], NULL);
+    Py_END_ALLOW_THREADS;
 
-        if (rc != thrd_success)
+    if (rc != thrd_success)
     {
       PyErr_SetString(PyExc_RuntimeError, "Unable to join worker thread");
       return -1;
@@ -2464,6 +2469,7 @@ static void When_dealloc(WhenObject *self)
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
+/** This is called when the @when decorator is used on a function. */
 static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
 {
   PyObject *thunk, *thunk_source, *thunk_name, *thunk_locals, *thunk_command;
@@ -2479,6 +2485,7 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
+  // the decorator is passed the decorated function
   thunk = PyTuple_GetItem(args, 0);
   if (thunk == NULL)
   {
@@ -2492,6 +2499,8 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
+  // The decorator instantiation indicates the regions that need to be
+  // obtained before the thunk can be run.
   regions = PySequence_List(self->regions);
   if (regions == NULL)
   {
@@ -2499,6 +2508,8 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
+  // We have to get the source of the thunk to avoid race conditions on the
+  // refcounts of builtins.
   thunk_source = get_source(thunk);
   if (thunk_source == NULL)
   {
@@ -2506,6 +2517,7 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
     return NULL;
   }
 
+  // We need to strip the decorator from the source
   index = PyUnicode_Find(thunk_source, PyUnicode_FromString("def"), 0, PyUnicode_GET_LENGTH(thunk_source), 1);
   if (index == -1)
   {
@@ -2530,6 +2542,7 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
   }
 
   thunk_command = PyUnicode_Concat(thunk_name, PyUnicode_FromString("("));
+
   // Iterate through the regions, adding them to the code and to the locals
   for (Py_ssize_t i = 0; i < PyList_Size(regions); ++i)
   {
@@ -2577,11 +2590,11 @@ static PyObject *When_call(WhenObject *self, PyObject *args, PyObject *kwds)
   }
 
   PRINTDBG("scheduling behavior\n");
-  Py_BEGIN_ALLOW_THREADS
-      rc = Behavior_schedule(b);
-  Py_END_ALLOW_THREADS
+  Py_BEGIN_ALLOW_THREADS;
+  rc = Behavior_schedule(b);
+  Py_END_ALLOW_THREADS;
 
-      if (rc != 0)
+  if (rc != 0)
   {
     PyErr_SetString(PyExc_RuntimeError, "Unable to schedule behavior");
     return NULL;
@@ -2628,19 +2641,32 @@ static void Isolated_finalize(PyObject *self)
   Py_DECREF(isolated_type);
 }
 
+/**
+ * This function serves as a nice example of the Isolated type pattern
+ * used in the module. The result is that the repr of the isolated type
+ * will be called, but only if the region is open.
+ */
 static PyObject *Isolated_repr(PyObject *self)
 {
   PyObject *repr;
+  // The object has had its ob_type pointer replaced with a pointer to the isolated type
   PyTypeObject *isolated_type = Py_TYPE(self);
+  // We get the inner type from the isolated type
   PyTypeObject *type = get_type(isolated_type);
   VPY_CHECKTYPE(type, NULL);
+  // We get the region from the isolated object
   RegionObject *region = get_region(self);
   VPY_CHECKREGION(region, NULL);
   VPY_CHECKREGIONOPEN(region, NULL);
 
+  // swap in the original type object
   self->ob_type = type;
+  // call the method
   repr = type->tp_repr(self);
+  // swap back in the isolated type object
   self->ob_type = isolated_type;
+
+  // this pattern is used in all Isolated methods
   return repr;
 }
 
@@ -2669,8 +2695,6 @@ static PyObject *Isolated_richcompare(PyObject *self, PyObject *other, int op)
   RegionObject *region = get_region(self);
   VPY_CHECKREGION(region, NULL);
   VPY_CHECKREGIONOPEN(region, NULL);
-
-  PRINTDBG("Isolated_richcompare %s\n", PyUnicode_AsUTF8(region->name));
 
   self->ob_type = type;
   result = type->tp_richcompare(self, other, op);
@@ -2733,23 +2757,28 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
   PyTypeObject *type = get_type(isolated_type);
   VPY_CHECKTYPE(type, NULL);
 
+  // we want to allow access to any attributes of the isolated type itself
   if (PyObject_HasAttr((PyObject *)isolated_type, attr_name))
   {
     return PyObject_GenericGetAttr(self, attr_name);
   }
 
-  self->ob_type = type;
+  // now we check for the region tag
   RegionTagObject *region_tag = get_tag(self, true);
   VPY_CHECKREGION(region_tag, NULL);
   RegionObject *region = region_tag->region;
 
   if (strcmp(PyUnicode_AsUTF8(attr_name), "__region__") == 0)
   {
+    // this is a special attribute, which does not require the
+    // region to be open
     result = (PyObject *)region_tag;
   }
   else if (region->is_open)
   {
+    self->ob_type = type;
     result = PyObject_GenericGetAttr(self, attr_name);
+    self->ob_type = isolated_type;
   }
   else
   {
@@ -2757,7 +2786,6 @@ static PyObject *Isolated_getattro(PyObject *self, PyObject *attr_name)
     result = NULL;
   }
 
-  self->ob_type = isolated_type;
   return result;
 }
 
@@ -2867,6 +2895,11 @@ static Py_ssize_t ssize_length(Py_ssize_t value)
   return length;
 }
 
+/**
+ * This is an attempt at making an object deeply immortal, but it does not quite work
+ * for objects which contain callables, notably type objects, as it will not make the
+ * objects referenced within them immortal (e.g. calls to built-ins)
+ */
 static int make_immortal(PyObject *obj)
 {
   Py_SET_REFCNT(obj, _Py_IMMORTAL_REFCNT);
@@ -2913,14 +2946,16 @@ static int make_immortal(PyObject *obj)
   return 0;
 }
 
-// Creates a new isolated type for the given type
-// The new type will wrap all of the methods of the given type
-// to enforce that the region containing an object of this
-// type is open. The resulting type will wrap a new type object
-// that is a copy of the given type object.
+/**
+ * Creates a new isolated type for the given type. The new type will wrap all of the
+ * methods of the given type to enforce that the region containing an object of this
+ * type is open. The resulting type will wrap a new type object that is a copy of the
+ * given type object.
+ */
 static PyTypeObject *isolate_type(PyTypeObject *type)
 {
   char *name;
+  // set up all the slots
   PyType_Slot slots[] = {
       {Py_tp_repr, NULL},
       {Py_tp_str, NULL},
@@ -3221,6 +3256,7 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
     }
   }
 
+  // create the new type
   const char *name_format = "interp_%li.isolated.%s";
   name = (char *)malloc(strlen(name_format) + strlen(type->tp_name) + ssize_length(alloc_id) + 1);
   sprintf(name, name_format, alloc_id, type->tp_name);
@@ -3242,6 +3278,7 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
 
   PRINTDBG("created isolated type %p for %s\n", isolated_type, type->tp_name);
 
+  // we need to store the inner type is it can be used in different interpreters
   PyObject *source = get_source((PyObject *)type);
   if (source == NULL)
   {
@@ -3268,10 +3305,12 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
   }
   else
   {
+    // add the type name to the end so we can use it later
     source = PyUnicode_Concat(source, PyUnicode_FromString("\n"));
     source = PyUnicode_Concat(source, PyUnicode_FromString(type->tp_name));
   }
 
+  // generate the unique type ID
   long long type_id = atomic_increment(&frozen_type_count);
   PyObject *type_id_long = PyLong_FromLongLong(type_id);
 
@@ -3283,6 +3322,9 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
     return NULL;
   }
 
+  // first we store the type object and source string on the local interpreter
+  // these objects will live for the duration of the interpreter and can be
+  // safely used from other interpreters
   PyObject *type_tuple = PyTuple_Pack(2, (PyObject *)type, source);
   if (type_tuple == NULL)
   {
@@ -3300,6 +3342,8 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
     return NULL;
   }
 
+  // we then store the pointers in the global type hashtable so it can be
+  // obtained when first referenced in another interpreter
   if (!ht_set(global_frozen_types, (voidptr_t)type_id, (voidptr_t)source))
   {
     Py_DECREF((PyObject *)isolated_type);
@@ -3931,12 +3975,15 @@ static PyTypeObject RegionTagType = {
 /*                  Module setup                               */
 /***************************************************************/
 
+/** Called on module startup */
 static int VPY_run()
 {
   int rc;
   bool expected = false;
   if (!atomic_compare_exchange_bool(&running, &expected, true))
   {
+    // someone has already called this method and the
+    // system is running
     return 0;
   }
 
@@ -3973,12 +4020,14 @@ static int VPY_run()
   return 0;
 }
 
+/** Shut down the system. */
 static int VPY_wait()
 {
   int rc;
   bool expected = true;
   if (!atomic_compare_exchange_bool(&running, &expected, false))
   {
+    // wait has already been called, no need to do anything
     return 0;
   }
 
@@ -4002,6 +4051,10 @@ static int VPY_wait()
 
   PRINTDBG("done waiting\n");
 
+  ht_free(global_frozen_types);
+  ht_free(global_object_regions);
+
+  // raise any exceptions which were thrown during execution
   ex = (BehaviorException *)atomic_load_ptr(&behavior_exceptions);
   if (ex != NULL)
   {
@@ -4025,9 +4078,6 @@ static int VPY_wait()
   }
 
   free_subinterpreters();
-
-  ht_free(global_object_regions);
-
   return 0;
 }
 
