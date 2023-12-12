@@ -2124,12 +2124,24 @@ static thrd_return_t worker(void *arg)
     }
     Py_DECREF(regions);
 
+    PyObject* closed = PySet_New(NULL);
+    if(closed == NULL){
+      PyErr_SetString(PyExc_RuntimeError, "Unable to allocate closed set");
+      rc = -1;
+      break;
+    }
+
     PRINTDBG("releasing requests\n");
     for (i = 0, r = b->requests; i < b->length; ++i, ++r)
     {
       RegionObject *region = resolve_region(r->target);
-      PRINTDBG("closing region %s\n", PyUnicode_AsUTF8(region->name));
-      region->is_open = false;
+      PyObject* region_id = PyLong_FromLongLong(region->id);
+      if(!PySet_Contains(closed, region_id)){
+        PRINTDBG("closing region %s\n", PyUnicode_AsUTF8(region->name));
+        region->is_open = false;
+        PySet_Add(closed, region_id);
+      }
+
       ts = PyEval_SaveThread();
       rc = Request_release(r);
       PyEval_RestoreThread(ts);
@@ -2139,6 +2151,8 @@ static thrd_return_t worker(void *arg)
         continue;
       }
     }
+
+    Py_DECREF(closed);
 
     if (rc != 0)
     {
@@ -3276,6 +3290,8 @@ static PyTypeObject *isolate_type(PyTypeObject *type)
     return NULL;
   }
 
+  Py_SET_REFCNT((PyObject *)isolated_type, _Py_IMMORTAL_REFCNT);
+
   PRINTDBG("created isolated type %p for %s\n", isolated_type, type->tp_name);
 
   // we need to store the inner type is it can be used in different interpreters
@@ -3523,6 +3539,8 @@ static int Region_init(RegionObject *self, PyObject *args, PyObject *kwds)
   }
 
   PRINTDBG("region init %s %lu @ %p\n", PyUnicode_AsUTF8(self->name), self->id, self);
+
+  Py_SET_REFCNT((PyObject *)self, _Py_IMMORTAL_REFCNT);
 
   return 0;
 }
@@ -3907,6 +3925,8 @@ static int RegionTag_init(RegionTagObject *self, PyObject *args, PyObject *kwds)
     return -1;
 
   self->region = (RegionObject *)region;
+
+  Py_SET_REFCNT((PyObject *)self, _Py_IMMORTAL_REFCNT);
 
   return 0;
 }

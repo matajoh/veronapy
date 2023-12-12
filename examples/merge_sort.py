@@ -97,7 +97,7 @@ def sort_section(source: tuple, start: int, end: int, output: region):
 
 def main():
     # Create an immutable list of integers as input
-    values = tuple([Item(random.randint(0, 100)) for _ in range(100)])
+    values = tuple([Item(random.randint(0, 10000)) for _ in range(10000)])
     print("unsorted:", values)
 
     # Create a region to hold the output
