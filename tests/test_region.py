@@ -1,12 +1,22 @@
 """Region tests."""
 
 import json
-from veronapy import region, RegionIsolationError
+
+import veronapy as vp
+from conftest import vpy_run
+
+
+class MockObject:
+    """Mock object used for testing."""
+
+    def __str__(self) -> str:
+        """Produces a simple representation of the object graph."""
+        return json.dumps(self.__dict__, default=lambda o: str(o))
 
 
 def test_creation():
-    r0 = region("a")
-    r1 = region("b")
+    r0 = vp.region("a")
+    r1 = vp.region("b")
     assert r0.name == "a"
     assert not r0.is_open
     assert not r0.is_shared
@@ -54,7 +64,7 @@ def test_creation():
 
 
 def test_open():
-    a = region("a")
+    a = vp.region("a")
     assert not a.is_open
     with a:
         assert a.is_open
@@ -63,8 +73,8 @@ def test_open():
 
 
 def test_parent():
-    a = region("a")
-    b = region("b")
+    a = vp.region("a")
+    b = vp.region("b")
     with a:
         a.child = b
         assert b.parent == a
@@ -76,16 +86,8 @@ def test_parent():
             raise AssertionError("Should have raised AttributeError")
 
 
-class MockObject:
-    """Mock object used for testing."""
-
-    def __str__(self) -> str:
-        """Produces a simple representation of the object graph."""
-        return json.dumps(self.__dict__)
-
-
 def test_adding():
-    r = region()   # closed, free and private
+    r = vp.region()   # closed, free and private
     o = MockObject()  # free
 
     with r:
@@ -95,13 +97,13 @@ def test_adding():
 
 
 def test_ownership():
-    r1 = region("Bank1")
-    r2 = region("Bank2")
+    r1 = vp.region("Bank1")
+    r2 = vp.region("Bank2")
     with r1, r2:
         r1.accounts = {"Alice": 1000}
         try:
             r2.accounts = r1.accounts
-        except RegionIsolationError:
+        except vp.RegionIsolationError:
             # ownership exception
             pass
         else:
@@ -109,7 +111,7 @@ def test_ownership():
 
 
 def test_isolation():
-    r1 = region("Bank1")
+    r1 = vp.region("Bank1")
     x = None
     with r1:
         r1.accounts = {"Alice": 1000}
@@ -117,7 +119,7 @@ def test_isolation():
 
     try:
         print(x["Alice"])
-    except RegionIsolationError:
+    except vp.RegionIsolationError:
         # the region not open
         pass
     else:
@@ -125,8 +127,8 @@ def test_isolation():
 
 
 def test_ownership_with_merging():
-    r1 = region()
-    r2 = region()
+    r1 = vp.region()
+    r2 = vp.region()
 
     with r1, r2:
         o1 = MockObject()      # free object
@@ -135,30 +137,30 @@ def test_ownership_with_merging():
         r1.f = o1              # o1 becomes owned by r1, as does o2
         try:
             r2.f = o2          # Throws an exception as o2 is in r1
-        except RegionIsolationError:
+        except vp.RegionIsolationError:
             pass
         else:
             raise AssertionError
 
 
 def test_region_ownership():
-    r1 = region("r1")
-    r2 = region("r2")
-    r3 = region("r3")
+    r1 = vp.region("r1")
+    r2 = vp.region("r2")
+    r3 = vp.region("r3")
 
     with r1, r2:
         r1.f = r3        # OK, r3 becomes owned by r1
         try:
             r2.f = r3    # Throws exception since r3 is already owned by r1
-        except RegionIsolationError:
+        except vp.RegionIsolationError:
             pass
         else:
             raise AssertionError
 
 
 def test_merge():
-    r1 = region()
-    r2 = region()
+    r1 = vp.region()
+    r2 = vp.region()
 
     with r1:
         r1.o1 = MockObject()
@@ -174,39 +176,13 @@ def test_merge():
         assert r2.o2.__region__ == r1    # validate r2 is an alias for r1
 
 
-def test_isolated_types():
-    r1 = region("r1")
-    r2 = region("r2")
-
-    class EmptyObject:
-        pass
-
-    def foo(self):
-        return "bar"
-
-    with r1:
-        r1.a = EmptyObject()
-        type(r1.a).foo = foo
-        assert r1.a.foo() == "bar"
-
-    with r2:
-        r2.b = EmptyObject()
-        r2.b.bar = 5
-        try:
-            r2.b.foo()  # should raise an attribute error
-        except AttributeError:
-            pass
-        else:
-            raise AssertionError
-
-        merged = r2.merge(r1)  # merge r1 into r2
-        r2.a = merged.a
-        assert r2.a.foo() == "bar"
-        assert r2.b.bar == 5
-
-    try:
-        EmptyObject.baz = foo
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("Should raise TypeError")
+if __name__ == "__main__":
+    vpy_run(test_creation)
+    vpy_run(test_open)
+    vpy_run(test_parent)
+    vpy_run(test_adding)
+    vpy_run(test_ownership)
+    vpy_run(test_isolation)
+    vpy_run(test_ownership_with_merging)
+    vpy_run(test_region_ownership)
+    vpy_run(test_merge)

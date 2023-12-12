@@ -1,12 +1,5 @@
-import json
-from veronapy import region, RegionIsolationError, wait, when, run
-
-
-class MockObject:
-    """Mock object used for testing."""
-    def __str__(self) -> str:
-        """Produces a simple representation of the object graph."""
-        return json.dumps(self.__dict__)
+from veronapy import region, RegionIsolationError, when
+from conftest import vpy_run
 
 
 def test_shareable():
@@ -15,7 +8,6 @@ def test_shareable():
 
 
 def test_when():
-    run()
     my_account = region()
     your_account = region()
 
@@ -37,11 +29,8 @@ def test_when():
         assert m.balance == 0
         assert y.balance == 100
 
-    wait()
-
 
 def test_detach():
-    run()
     c1 = region("c1")
     c2 = region("c2")
 
@@ -67,11 +56,8 @@ def test_detach():
         assert c1.b == "bar"
         assert c2.a == "foo"
 
-    wait()
-
 
 def test_when_private():
-    run()
     r1 = region("Bank1")
     r2 = region("Bank2")
 
@@ -86,11 +72,9 @@ def test_when_private():
     else:
         raise AssertionError
 
-    wait()
-
 
 if __name__ == "__main__":
-    test_shareable()
-    test_when()
-    test_detach()
-    test_when_private()
+    vpy_run(test_shareable)
+    vpy_run(test_when)
+    vpy_run(test_detach)
+    vpy_run(test_when_private)
